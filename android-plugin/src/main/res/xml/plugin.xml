@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<plugin>
+    <apiVersion>0.1</apiVersion>
+    <description>@string/description</description>
+    <hasService>true</hasService>
+</plugin>

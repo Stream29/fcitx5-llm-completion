@@ -7,6 +7,7 @@
 #include <fcitx/addonfactory.h>
 #include <fcitx/addoninstance.h>
 #include <fcitx/addonmanager.h>
+#include <fcitx/candidatelist.h>
 #include <fcitx/event.h>
 #include <fcitx/inputcontext.h>
 #include <fcitx/inputpanel.h>
@@ -17,6 +18,7 @@
 #include <fcitx/userinterfacemanager.h>
 
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -526,15 +528,16 @@ private:
         if (!caps.test(CapabilityFlag::Preedit)) {
             return false;
         }
-        // Never collide with an active main IM composition or candidate list.
-        if (!allowOwnProposal && !ic->inputPanel().clientPreedit().empty()) {
-            return false;
+        if (!allowOwnProposal) {
+            if (!ic->inputPanel().clientPreedit().empty()) {
+                return false;
+            }
+            if (auto cand = ic->inputPanel().candidateList();
+                cand && !cand->empty()) {
+                return false;
+            }
         }
         if (!ic->inputPanel().preedit().empty()) {
-            return false;
-        }
-        if (auto cand = ic->inputPanel().candidateList();
-            cand && !cand->empty()) {
             return false;
         }
         return true;
@@ -655,6 +658,63 @@ private:
         }
     }
 
+#ifdef __ANDROID__
+    class ProposalCandidateWord : public CandidateWord {
+    public:
+        ProposalCandidateWord(LlmCompletion *owner, std::string label,
+                              size_t chunkCount)
+            : CandidateWord(Text(std::move(label))), owner_(owner),
+              chunkCount_(chunkCount) {}
+
+        void select(InputContext *ic) const override {
+            owner_->acceptChunkCount(ic, chunkCount_);
+        }
+
+    private:
+        LlmCompletion *owner_;
+        size_t chunkCount_;
+    };
+
+    void acceptChunkCount(InputContext *ic, size_t count) {
+        if (!hasProposal_ || activeIC_ != ic) {
+            return;
+        }
+        cancelPending();
+        std::string accepted;
+        std::string remaining;
+        std::vector<std::string> remainingChunks;
+
+        if (!proposalChunks_.empty()) {
+            size_t take = std::min(count, proposalChunks_.size());
+            for (size_t i = 0; i < take; ++i) {
+                accepted += proposalChunks_[i];
+            }
+            remainingChunks.assign(proposalChunks_.begin() + take,
+                                   proposalChunks_.end());
+            for (const auto &c : remainingChunks) {
+                remaining += c;
+            }
+        } else {
+            accepted = proposalText_;
+        }
+
+        clearProposal(ic);
+        suppressNextCommit_ = true;
+        ic->commitString(accepted);
+        suppressNextCommit_ = false;
+
+        auto &buf = ringBuffers_[ic];
+        buf += accepted;
+        trimRingBuffer(buf);
+
+        if (!remaining.empty()) {
+            showProposal(ic, remaining, remainingChunks);
+        } else {
+            scheduleTrigger(ic);
+        }
+    }
+#endif
+
     void showProposal(InputContext *ic, const std::string &text,
                       const std::vector<std::string> &chunks) {
         if (text.empty() || !isEligible(ic, hasProposal_ && activeIC_ == ic)) {
@@ -668,6 +728,24 @@ private:
         hasProposal_ = true;
         proposalText_ = text;
         proposalChunks_ = chunks;
+
+#ifdef __ANDROID__
+        auto candList = std::make_unique<CommonCandidateList>();
+        candList->setPageSize(10);
+        if (!chunks.empty()) {
+            for (size_t i = 0; i < chunks.size(); ++i) {
+                candList->append<ProposalCandidateWord>(this, chunks[i], i + 1);
+            }
+            if (chunks.size() > 1) {
+                candList->append<ProposalCandidateWord>(this, "✓ " + text,
+                                                        chunks.size());
+            }
+        } else {
+            candList->append<ProposalCandidateWord>(this, text, 1);
+        }
+        ic->inputPanel().setCandidateList(std::move(candList));
+        ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+#endif
     }
 
     void clearProposal(InputContext *ic) {
@@ -680,6 +758,10 @@ private:
         if (ic) {
             ic->inputPanel().setClientPreedit(Text());
             ic->updatePreedit();
+#ifdef __ANDROID__
+            ic->inputPanel().setCandidateList(nullptr);
+            ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+#endif
         }
     }
 
@@ -711,14 +793,24 @@ private:
         }
         struct sockaddr_un addr {};
         addr.sun_family = AF_UNIX;
+#ifdef __ANDROID__
+        constexpr char kAbstractName[] = "fcitx5-llm-completion";
+        addr.sun_path[0] = '\0';
+        std::memcpy(addr.sun_path + 1, kAbstractName, sizeof(kAbstractName) - 1);
+        socklen_t addrLen =
+            static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) + 1 +
+                                   (sizeof(kAbstractName) - 1));
+#else
         if (socketPath_.size() >= sizeof(addr.sun_path)) {
             ::close(fd);
             return false;
         }
         std::strncpy(addr.sun_path, socketPath_.c_str(),
                      sizeof(addr.sun_path) - 1);
+        socklen_t addrLen = sizeof(addr);
+#endif
         if (::connect(fd, reinterpret_cast<struct sockaddr *>(&addr),
-                      sizeof(addr)) < 0) {
+                      addrLen) < 0) {
             if (errno != EINPROGRESS) {
                 ::close(fd);
                 return false;

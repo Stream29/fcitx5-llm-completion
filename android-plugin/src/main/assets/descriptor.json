@@ -1,0 +1,10 @@
+{
+    "sha256": "3839f1be43b4a952fae8f15726a13e8ea12d307198eba9dc6819abb61db9d4f5",
+    "files": {
+        "usr": "",
+        "usr/share": "",
+        "usr/share/fcitx5": "",
+        "usr/share/fcitx5/addon": "",
+        "usr/share/fcitx5/addon/llmcompletion.conf": "79fe742105b8caf72dec9a361c48ca4381847116b96ea5c4ac1d801be8db7251"
+    }
+}

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Fcitx5 LLM Completion</string>
+    <string name="description">Copilot-style LLM inline completion via Aliyun DashScope</string>
+</resources>
