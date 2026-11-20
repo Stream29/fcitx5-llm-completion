@@ -30,6 +30,10 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
+#ifdef __ANDROID__
+#include <dlfcn.h>
+#include <jni.h>
+#endif
 
 namespace fcitx {
 
@@ -783,39 +787,165 @@ private:
             });
     }
 
+#ifdef __ANDROID__
+int openAndroidBridgeSocket() {
+    using GetCreatedJavaVMsFn = jint (*)(JavaVM **, jsize, jsize *);
+    auto fn = reinterpret_cast<GetCreatedJavaVMsFn>(
+        ::dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs"));
+    if (!fn) {
+        return -1;
+    }
+    JavaVM *vm = nullptr;
+    jsize count = 0;
+    if (fn(&vm, 1, &count) != JNI_OK || count <= 0 || !vm) {
+        return -1;
+    }
+    JNIEnv *env = nullptr;
+    bool attached = false;
+    jint st = vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
+    if (st == JNI_EDETACHED) {
+        if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) {
+            return -1;
+        }
+        attached = true;
+    } else if (st != JNI_OK || !env) {
+        return -1;
+    }
+
+    int resultFd = -1;
+    auto clearEx = [&]() {
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+    };
+
+    jclass atClass = env->FindClass("android/app/ActivityThread");
+    if (atClass) {
+        jmethodID curAppMid = env->GetStaticMethodID(
+            atClass, "currentApplication", "()Landroid/app/Application;");
+        jobject app = curAppMid ? env->CallStaticObjectMethod(atClass, curAppMid)
+                                : nullptr;
+        clearEx();
+        if (app) {
+            jclass ctxClass = env->GetObjectClass(app);
+            jmethodID getCrMid = env->GetMethodID(
+                ctxClass, "getContentResolver",
+                "()Landroid/content/ContentResolver;");
+            jobject cr = getCrMid ? env->CallObjectMethod(app, getCrMid) : nullptr;
+            clearEx();
+            if (cr) {
+                jclass uriClass = env->FindClass("android/net/Uri");
+                jmethodID parseMid =
+                    uriClass ? env->GetStaticMethodID(
+                                   uriClass, "parse",
+                                   "(Ljava/lang/String;)Landroid/net/Uri;")
+                             : nullptr;
+                jstring uriStr = env->NewStringUTF(
+                    "content://org.fcitx.fcitx5.android.plugin.llm_completion.provider");
+                jobject uri = parseMid ? env->CallStaticObjectMethod(
+                                             uriClass, parseMid, uriStr)
+                                       : nullptr;
+                clearEx();
+                if (uri) {
+                    jclass crClass = env->GetObjectClass(cr);
+                    jmethodID callMid = env->GetMethodID(
+                        crClass, "call",
+                        "(Landroid/net/Uri;Ljava/lang/String;Ljava/lang/String;"
+                        "Landroid/os/Bundle;)Landroid/os/Bundle;");
+                    jstring methodStr = env->NewStringUTF("openSocket");
+                    jobject bundle =
+                        callMid ? env->CallObjectMethod(cr, callMid, uri,
+                                                        methodStr, nullptr,
+                                                        nullptr)
+                                : nullptr;
+                    clearEx();
+                    if (bundle) {
+                        jclass bundleClass = env->GetObjectClass(bundle);
+                        jmethodID getParcMid = env->GetMethodID(
+                            bundleClass, "getParcelable",
+                            "(Ljava/lang/String;)Landroid/os/Parcelable;");
+                        jstring fdKey = env->NewStringUTF("fd");
+                        jobject pfd =
+                            getParcMid ? env->CallObjectMethod(
+                                             bundle, getParcMid, fdKey)
+                                       : nullptr;
+                        clearEx();
+                        if (pfd) {
+                            jclass pfdClass = env->GetObjectClass(pfd);
+                            jmethodID detachMid =
+                                env->GetMethodID(pfdClass, "detachFd", "()I");
+                            if (detachMid) {
+                                int fd = env->CallIntMethod(pfd, detachMid);
+                                clearEx();
+                                if (fd >= 0) {
+                                    int flags = ::fcntl(fd, F_GETFL, 0);
+                                    if (flags >= 0) {
+                                        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+                                    }
+                                    ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+                                    resultFd = fd;
+                                }
+                            }
+                            env->DeleteLocalRef(pfdClass);
+                            env->DeleteLocalRef(pfd);
+                        }
+                        env->DeleteLocalRef(fdKey);
+                        env->DeleteLocalRef(bundleClass);
+                        env->DeleteLocalRef(bundle);
+                    }
+                    env->DeleteLocalRef(methodStr);
+                    env->DeleteLocalRef(crClass);
+                    env->DeleteLocalRef(uri);
+                }
+                env->DeleteLocalRef(uriStr);
+                if (uriClass) {
+                    env->DeleteLocalRef(uriClass);
+                }
+                env->DeleteLocalRef(cr);
+            }
+            env->DeleteLocalRef(ctxClass);
+            env->DeleteLocalRef(app);
+        }
+        env->DeleteLocalRef(atClass);
+    }
+    clearEx();
+    if (attached) {
+        vm->DetachCurrentThread();
+    }
+    return resultFd;
+}
+#endif
+
     bool ensureConnected() {
         if (sockFd_ >= 0) {
             return true;
         }
+#ifdef __ANDROID__
+        int fd = openAndroidBridgeSocket();
+        if (fd < 0) {
+            return false;
+        }
+#else
         int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0) {
             return false;
         }
         struct sockaddr_un addr {};
         addr.sun_family = AF_UNIX;
-#ifdef __ANDROID__
-        constexpr char kAbstractName[] = "fcitx5-llm-completion";
-        addr.sun_path[0] = '\0';
-        std::memcpy(addr.sun_path + 1, kAbstractName, sizeof(kAbstractName) - 1);
-        socklen_t addrLen =
-            static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) + 1 +
-                                   (sizeof(kAbstractName) - 1));
-#else
         if (socketPath_.size() >= sizeof(addr.sun_path)) {
             ::close(fd);
             return false;
         }
         std::strncpy(addr.sun_path, socketPath_.c_str(),
                      sizeof(addr.sun_path) - 1);
-        socklen_t addrLen = sizeof(addr);
-#endif
         if (::connect(fd, reinterpret_cast<struct sockaddr *>(&addr),
-                      addrLen) < 0) {
+                      sizeof(addr)) < 0) {
             if (errno != EINPROGRESS) {
                 ::close(fd);
                 return false;
             }
         }
+#endif
 
         sockFd_ = fd;
         readBuf_.clear();

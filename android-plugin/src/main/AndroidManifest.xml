@@ -35,5 +35,11 @@
                 <action android:name="org.fcitx.fcitx5.android.plugin.SERVICE" />
             </intent-filter>
         </service>
+
+        <provider
+            android:name=".LlmCompletionProvider"
+            android:authorities="org.fcitx.fcitx5.android.plugin.llm_completion.provider"
+            android:directBootAware="true"
+            android:exported="true" />
     </application>
 </manifest>
