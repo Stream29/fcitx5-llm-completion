@@ -83,6 +83,7 @@ class DashScopeClient(
 
     suspend fun suggestStream(
         req: SuggestRequest,
+        shouldStop: () -> Boolean = { false },
         onUpdate: (accumulated: String, chunks: List<String>) -> Unit = { _, _ -> },
     ): SuggestResult {
         val (trimmedPrefix, trailingWS) = preparePrefix(req.prefix)
@@ -131,8 +132,9 @@ class DashScopeClient(
             }
 
             val channel = response.bodyAsChannel()
-            while (true) {
+            while (!shouldStop()) {
                 val rawLine = channel.readUTF8Line() ?: break
+                if (shouldStop()) break
                 val line = rawLine.trim()
                 if (!line.startsWith("data:")) continue
                 val data = line.removePrefix("data:").trim()

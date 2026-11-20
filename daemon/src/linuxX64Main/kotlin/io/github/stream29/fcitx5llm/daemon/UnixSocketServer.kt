@@ -8,7 +8,6 @@ import io.github.stream29.fcitx5llm.IpcRequest
 import io.github.stream29.fcitx5llm.IpcResponse
 import io.github.stream29.fcitx5llm.SuggestRequest
 import io.github.stream29.fcitx5llm.ipcJson
-import kotlinx.cinterop.ByteVar
 import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.alloc
 import kotlinx.cinterop.convert
@@ -21,12 +20,11 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withTimeout
 import platform.linux.sockaddr_un
 import platform.posix.AF_UNIX
 import platform.posix.EINTR
@@ -57,6 +55,8 @@ internal class UnixSocketServer(
     private val requestTimeout: Duration,
 ) {
     private val listenFd = AtomicInt(-1)
+    // Serialize libcurl calls across all clients to avoid ktor-client-curl multi-thread cancel races.
+    private val curlMutex = Mutex()
 
     fun stop() {
         val fd = listenFd.getAndSet(-1)
@@ -119,7 +119,8 @@ internal class UnixSocketServer(
     private suspend fun handleClient(scope: CoroutineScope, clientFd: Int) {
         val writeMutex = Mutex()
         val currentReqId = AtomicLong(0L)
-        var inflightJob: Job? = null
+        // CONFLATED queue keeps only the latest pending suggest request during rapid typing.
+        val pendingQueue = Channel<IpcRequest>(Channel.CONFLATED)
 
         suspend fun sendResponse(resp: IpcResponse) {
             val line = ipcJson.encodeToString(IpcResponse.serializer(), resp) + "\n"
@@ -136,6 +137,72 @@ internal class UnixSocketServer(
                         )
                         if (n <= 0) break
                         offset += n.toInt()
+                    }
+                }
+            }
+        }
+
+        val workerJob = scope.launch(Dispatchers.IO) {
+            for (req in pendingQueue) {
+                if (currentReqId.value != req.reqId) continue
+
+                val model = router.selectModel(req.program)
+                println("suggest req=${req.reqId} program=\"${req.program}\" model=$model")
+
+                try {
+                    val result = curlMutex.withLock {
+                        if (currentReqId.value != req.reqId) return@withLock null
+                        dashScope.suggestStream(
+                            req = SuggestRequest(
+                                model = model,
+                                prefix = req.prefix,
+                                maxTokens = req.maxTokens,
+                            ),
+                            shouldStop = { currentReqId.value != req.reqId },
+                        ) { accumulated, chunks ->
+                            if (currentReqId.value != req.reqId) return@suggestStream
+                            scope.launch(Dispatchers.IO) {
+                                if (currentReqId.value == req.reqId) {
+                                    sendResponse(
+                                        IpcResponse(
+                                            type = "proposal",
+                                            reqId = req.reqId,
+                                            text = accumulated,
+                                            chunks = chunks,
+                                            done = false,
+                                            model = model,
+                                        ),
+                                    )
+                                }
+                            }
+                        }
+                    } ?: continue
+
+                    if (currentReqId.value == req.reqId) {
+                        sendResponse(
+                            IpcResponse(
+                                type = "proposal",
+                                reqId = req.reqId,
+                                text = result.text,
+                                chunks = result.chunks,
+                                done = true,
+                                model = result.model,
+                                latencyMs = result.latency.inWholeMilliseconds,
+                            ),
+                        )
+                    }
+                } catch (_: CancellationException) {
+                    break
+                } catch (e: Exception) {
+                    if (currentReqId.value == req.reqId) {
+                        sendResponse(
+                            IpcResponse(
+                                type = "error",
+                                reqId = req.reqId,
+                                model = model,
+                                error = e.message ?: e::class.simpleName ?: "unknown error",
+                            ),
+                        )
                     }
                 }
             }
@@ -175,80 +242,17 @@ internal class UnixSocketServer(
 
                         "cancel" -> {
                             currentReqId.value = 0L
-                            inflightJob?.cancel()
-                            inflightJob = null
                         }
 
                         "suggest" -> {
                             val userBlacklist = blacklist.current()
                             if (!router.isAllowed(req.program, userBlacklist) || req.prefix.isEmpty()) {
                                 currentReqId.value = 0L
-                                inflightJob?.cancel()
-                                inflightJob = null
                                 sendResponse(IpcResponse(type = "proposal", reqId = req.reqId, text = "", done = true))
                                 continue
                             }
-
-                            val model = router.selectModel(req.program)
-                            println("suggest req=${req.reqId} program=\"${req.program}\" model=$model")
-
-                            inflightJob?.cancel()
                             currentReqId.value = req.reqId
-                            inflightJob = scope.launch(Dispatchers.IO) {
-                                try {
-                                    val result = withTimeout(requestTimeout) {
-                                        dashScope.suggestStream(
-                                            SuggestRequest(
-                                                model = model,
-                                                prefix = req.prefix,
-                                                maxTokens = req.maxTokens,
-                                            ),
-                                        ) { accumulated, chunks ->
-                                            if (currentReqId.value != req.reqId) return@suggestStream
-                                            scope.launch(Dispatchers.IO) {
-                                                if (currentReqId.value == req.reqId) {
-                                                    sendResponse(
-                                                        IpcResponse(
-                                                            type = "proposal",
-                                                            reqId = req.reqId,
-                                                            text = accumulated,
-                                                            chunks = chunks,
-                                                            done = false,
-                                                            model = model,
-                                                        ),
-                                                    )
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if (currentReqId.value == req.reqId) {
-                                        sendResponse(
-                                            IpcResponse(
-                                                type = "proposal",
-                                                reqId = req.reqId,
-                                                text = result.text,
-                                                chunks = result.chunks,
-                                                done = true,
-                                                model = result.model,
-                                                latencyMs = result.latency.inWholeMilliseconds,
-                                            ),
-                                        )
-                                    }
-                                } catch (_: CancellationException) {
-                                    // Superseded by newer request or explicit cancel.
-                                } catch (e: Exception) {
-                                    if (currentReqId.value == req.reqId) {
-                                        sendResponse(
-                                            IpcResponse(
-                                                type = "error",
-                                                reqId = req.reqId,
-                                                model = model,
-                                                error = e.message ?: e::class.simpleName ?: "unknown error",
-                                            ),
-                                        )
-                                    }
-                                }
-                            }
+                            pendingQueue.trySend(req)
                         }
 
                         else -> sendResponse(IpcResponse(type = "error", reqId = req.reqId, error = "unknown type"))
@@ -256,7 +260,9 @@ internal class UnixSocketServer(
                 }
             }
         } finally {
-            inflightJob?.cancel()
+            currentReqId.value = 0L
+            pendingQueue.close()
+            workerJob.cancel()
             close(clientFd)
         }
     }
