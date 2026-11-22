@@ -2,5 +2,5 @@
 <plugin>
     <apiVersion>0.1</apiVersion>
     <description>@string/description</description>
-    <hasService>true</hasService>
+    <hasService>false</hasService>
 </plugin>
