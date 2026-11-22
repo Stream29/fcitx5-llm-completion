@@ -1,46 +1,47 @@
-CXX ?= g++
-CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -fPIC $(shell pkg-config --cflags Fcitx5Core Fcitx5Utils)
-LDFLAGS := -shared $(shell pkg-config --libs Fcitx5Core Fcitx5Utils)
-
+CMAKE ?= $(shell command -v cmake 2>/dev/null || ls -1d $(HOME)/Android/Sdk/cmake/*/bin/cmake 2>/dev/null | tail -n 1)
+CTEST ?= $(shell command -v ctest 2>/dev/null || ls -1d $(HOME)/Android/Sdk/cmake/*/bin/ctest 2>/dev/null | tail -n 1)
+GRADLE ?= $(shell ls -1d $(HOME)/.gradle/wrapper/dists/gradle-9.6.1-bin/*/gradle-9.6.1/bin/gradle 2>/dev/null | tail -n 1 || command -v gradle 2>/dev/null)
+JAVA_HOME_ANDROID ?= $(HOME)/.sdkman/candidates/java/17.0.19-tem
+ANDROID_SDK_DIR ?= $(HOME)/Android/Sdk
+BUILD_DIR := build
 FCITX5_LIB_DIR := /usr/lib/x86_64-linux-gnu/fcitx5
 FCITX5_USER_ADDON_DIR := $(HOME)/.local/share/fcitx5/addon
-DAEMON_BIN := daemon/build/bin/linuxX64/releaseExecutable/fcitx5-llm-completion-daemon.kexe
-USER_BIN_DIR := $(HOME)/.local/bin
 
-.PHONY: all build-addon build-daemon test dist install uninstall clean
+.PHONY: all configure build-addon test android-apk dist install uninstall clean
 
-all: build-addon build-daemon
+all: build-addon
 
-build-addon: build/libllmcompletion.so
+configure:
+	@"$(CMAKE)" -S . -B "$(BUILD_DIR)" -G Ninja -DCMAKE_BUILD_TYPE=Release
 
-build/libllmcompletion.so: addon/llmcompletion.cpp
-	@mkdir -p build
-	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+build-addon: configure
+	@"$(CMAKE)" --build "$(BUILD_DIR)"
 
-build-daemon:
-	./gradlew :daemon:linkReleaseExecutableLinuxX64
+test: build-addon
+	@"$(CTEST)" --test-dir "$(BUILD_DIR)" --output-on-failure
 
-test:
-	./gradlew :core:allTests
-
-dist: all
+android-apk:
+	JAVA_HOME="$(JAVA_HOME_ANDROID)" ANDROID_HOME="$(ANDROID_SDK_DIR)" \
+		"$(GRADLE)" -p android-plugin assembleDebug --no-daemon
 	@mkdir -p dist
-	cp "$(DAEMON_BIN)" dist/fcitx5-llm-completion-daemon-linux-x86_64
-	chmod 0755 dist/fcitx5-llm-completion-daemon-linux-x86_64
-	tar -czf dist/fcitx5-llm-completion-addon-linux-x86_64.tar.gz \
-		-C build libllmcompletion.so \
-		-C ../addon llmcompletion.conf
+	@cp android-plugin/build/outputs/apk/debug/*.apk \
+		dist/org.fcitx.fcitx5.android.plugin.llm_completion-v2.0.0-arm64-v8a.apk
+	@echo "APK ready: dist/org.fcitx.fcitx5.android.plugin.llm_completion-v2.0.0-arm64-v8a.apk"
 
-install: all
-	mkdir -p "$(FCITX5_USER_ADDON_DIR)" "$(USER_BIN_DIR)"
-	install -m 0644 addon/llmcompletion.conf "$(FCITX5_USER_ADDON_DIR)/llmcompletion.conf"
-	install -m 0755 "$(DAEMON_BIN)" "$(USER_BIN_DIR)/fcitx5-llm-completion-daemon"
-	run0 install -m 0755 build/libllmcompletion.so "$(FCITX5_LIB_DIR)/libllmcompletion.so"
+dist: build-addon
+	@mkdir -p dist
+	tar -czf dist/fcitx5-llm-completion-addon-linux-x86_64.tar.gz \
+		-C "$(BUILD_DIR)" libllmcompletion.so \
+		-C ../src/addon llmcompletion.conf
+
+install: build-addon
+	mkdir -p "$(FCITX5_USER_ADDON_DIR)"
+	install -m 0644 src/addon/llmcompletion.conf "$(FCITX5_USER_ADDON_DIR)/llmcompletion.conf"
+	run0 install -o root -g root -m 0755 "$(BUILD_DIR)/libllmcompletion.so" "$(FCITX5_LIB_DIR)/libllmcompletion.so"
 
 uninstall:
 	rm -f "$(FCITX5_USER_ADDON_DIR)/llmcompletion.conf"
-	rm -f "$(USER_BIN_DIR)/fcitx5-llm-completion-daemon"
 	run0 rm -f "$(FCITX5_LIB_DIR)/libllmcompletion.so"
 
 clean:
-	rm -rf build dist
+	rm -rf "$(BUILD_DIR)" dist android-plugin/build android-plugin/.cxx android-plugin/.gradle

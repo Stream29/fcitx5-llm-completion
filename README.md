@@ -1,38 +1,50 @@
 # fcitx5-llm-completion
 
-Copilot-style LLM inline completion for Fcitx5 (Linux & Android KMP core), backed by Aliyun DashScope zero-prompt Partial Mode streaming.
+100% Pure-C++20 Single-Library (`libllmcompletion.so`) Offline Pure-Unicode `RWKV-8 ("Heron") + Two-Tier Personal ROSA` NPU Inline Completion for Fcitx5 (Linux Intel AI Boost NPU & Android Qualcomm QNN / LiteRT NPU).
 
-## Architecture
+## Architecture (`CMake + Ninja`)
 
-- **`core/`** (Kotlin Multiplatform: `commonMain`, `jvm`, `linuxX64`):
-  - `DashScopeClient`: Zero-prompt Partial Mode (`partial: true`, `enable_thinking: false`), SSE streaming, BPE token `chunks`, 2048-char prefix window.
-  - `AppRouter`: Per-app model routing (`qwen-flash` / `qwen3-coder-flash`) and blacklist filtering.
-  - `Protocol`: NDJSON IPC schema shared across platforms.
-- **`daemon/`** (Kotlin/Native `linuxX64` CLI):
-  - `fcitx5-llm-completion-daemon`: Native binary using `ktor-client-curl` (HTTP/2 Keep-Alive), POSIX Unix Domain Socket (`$XDG_RUNTIME_DIR/fcitx5-llm-completion.sock`, mode `0600`), latest-wins request cancellation, and hot-reloadable `~/.config/fcitx5-llm-completion/blacklist.txt`.
-- **`addon/`** (Thin C++ Fcitx5 Core module):
-  - `libllmcompletion.so` + `llmcompletion.conf`: 0ms immediate trigger, Rime-safe `clientPreedit`, BPE word-chunk acceptance (`Ctrl+Tab`), full acceptance (`Ctrl+Shift+Tab`), cancel (`Esc`), and tray StatusArea toggle + `Ctrl+Alt+I`.
+- **`src/core/`** (Cross-Platform Pure C++20 Static Library `fcitx5_llm_core` — shared across Linux & Android NDK):
+  - `unicode_codec.{hpp,cpp}`: BPE-free `PureUnicodeCodec` (`Vocab = 4096`: 3,830 direct Unicode codepoints + 256 lossless UTF-8 fallback bytes + 10 interaction event tokens) and zero-width DOM placeholder sanitization (`U+200B`, `U+2060`, `U+FEFF`).
+  - `online_sam.{hpp,cpp}`: Tier-A live session `EventAwareOnlineSAM` (`ROSA` exact cross-app suffix automaton with seamless tombstone backspace rollback and `predictions.jsonl` warm-start).
+  - `online_adapter.{hpp,cpp}`: NPU-resident full-rank FP16 Test-Time Training manager (`online_adapter.bin`) + language-agnostic Bayesian-Shannon `DynamicSuffixMemory` (`online_suffix.bin`, zero hardcoded word lists).
+  - `suffix_index.{hpp,cpp}` + `npz_reader.{hpp,cpp}`: Native `zlib` `.npz` loader + Tier-B `PersonalSuffixIndex` (`O(log N)` multi-order suffix retrieval & background unigram/branching priors).
+  - `rwkv8_engine.{hpp,cpp}`: Hardware-agnostic `RWKV-8` recurrent state machine, Copy-on-Write speculative rollout, mid-token atomic preemption, and always-display step-0 decoding.
+  - `text_ops.{hpp,cpp}`: Word/character chunking (`segmentCompletionChunks`), bracket-balance-aware FIM suffix deduplication (`trimSuffixOverlap`), hot-reloaded `AppBlacklist`, and `10 MiB × 5` rotating `PredictionLogger`.
+- **`src/backends/`** (`IRwkvStepRunner` single-method NPU hardware abstraction):
+  - `openvino_runner.cpp` (Linux `x86_64`): Native OpenVINO C++ Runtime (`openvino::runtime`) targeting `Intel(R) AI Boost` NPU (`NPU -> GPU -> CPU` automatic fallback, `~4.5 ms` TTFT on `< 50 MB` `37.26M` INT8 model).
+  - `android_npu_runner.cpp` (Android `arm64-v8a`): Dynamic `QNN HTP / LiteRT / NNAPI ACCELERATOR` NPU runner.
+- **`src/addon/llmcompletion.cpp`** (Self-Contained `libllmcompletion.so` — zero external daemon or socket):
+  - Runs NPU initialization and inference asynchronously on an internal `std::jthread` with lock-free atomic request preemption and `pipe2` `EventLoop` wakeup (`0 ms` main-thread blocking).
+  - Renders proposals via zero-DOM-leak cursor-following `InputPanel` (`setAuxUp("⇥ ...")` on Desktop, `CandidateList` on Android), keeping `clientPreedit` 100% empty.
 
 ## Quick Start (Linux)
 
 ```bash
-# Build daemon CLI + C++ addon
-make all
+# Build + run C++20 unit & NPU integration tests
+make test
 
-# Install addon & daemon CLI
+# Install libllmcompletion.so and reload Fcitx5
 make install
-
-# Run daemon (reads DASHSCOPE_API_KEY env or ~/ACodeSpace/dashscope.env)
-fcitx5-llm-completion-daemon &
-
-# Reload Fcitx5
 fcitx5 -r -d
 ```
 
+## Android (`fcitx5-android` Plugin APK)
+
+```bash
+# Cross-compile arm64-v8a libllmcompletion.so and package standalone plugin APK
+make android-apk
+
+# Install onto Android phone running Fcitx5 for Android
+adb install -r dist/org.fcitx.fcitx5.android.plugin.llm_completion-v2.0.0-arm64-v8a.apk
+```
+
+- **Collector-Only Mode (Default without local model)**: When `models/unicode-37m-rwkv8` is absent on the phone, the background worker runs with zero NPU/RAM overhead and records non-password interaction events to `/storage/emulated/0/Android/data/org.fcitx.fcitx5.android/files/data/llm-completion/predictions.jsonl`.
+
 ## Keybindings & Controls
 
-- **`Ctrl + Tab`**: Accept one BPE word/token chunk.
-- **`Ctrl + Shift + Tab`**: Accept the entire remaining proposal.
-- **`Esc`** (or keep typing): Dismiss proposal.
+- **`Ctrl + Tab`**: Accept one word/character chunk (auto-chains when final chunk is accepted).
+- **`Esc`** (or keep typing): Dismiss proposal (records reject state so dismissed text is not repeated).
 - **`Ctrl + Alt + I`** or Fcitx5 tray menu (**内联补全: 开/关**): Toggle on/off.
 - **`~/.config/fcitx5-llm-completion/blacklist.txt`**: One app name per line (`#` comments allowed), hot-reloaded on save.
+- **`FCITX5_LLM_ONLINE_LR`**: Optional environment variable (`0.0`–`5.0`, default `1.45`) tuning real-time NPU SGD online adaptation rate.
