@@ -139,21 +139,10 @@ Text makeProposalAuxText(const std::string &text) {
 #endif
 
 size_t firstTokenByteLen(const std::string &s) {
-    size_t i = 0;
-    while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) {
-        ++i;
+    if (s.empty()) {
+        return 0;
     }
-    if (i >= s.size()) {
-        return s.size();
-    }
-    unsigned char c = static_cast<unsigned char>(s[i]);
-    if (isAsciiWordChar(c)) {
-        while (i < s.size() &&
-               isAsciiWordChar(static_cast<unsigned char>(s[i]))) {
-            ++i;
-        }
-        return i;
-    }
+    unsigned char c = static_cast<unsigned char>(s[0]);
     size_t charLen = 1;
     if ((c & 0xE0) == 0xC0) {
         charLen = 2;
@@ -162,7 +151,7 @@ size_t firstTokenByteLen(const std::string &s) {
     } else if ((c & 0xF8) == 0xF0) {
         charLen = 4;
     }
-    return std::min(s.size(), i + charLen);
+    return std::min(s.size(), charLen);
 }
 
 void sliceAfterPrefixBytes(const std::vector<std::string> &inChunks,

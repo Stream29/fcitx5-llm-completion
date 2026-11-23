@@ -13,8 +13,6 @@ namespace fcitx5_llm {
 
 namespace {
 
-bool isHorizontalWs(char c) { return c == ' ' || c == '\t'; }
-
 size_t nextUtf8ScalarBytes(std::string_view s, size_t i) {
     unsigned char c = static_cast<unsigned char>(s[i]);
     size_t len = 1;
@@ -26,33 +24,6 @@ size_t nextUtf8ScalarBytes(std::string_view s, size_t i) {
         len = 4;
     }
     return std::min(len, s.size() - i);
-}
-
-std::vector<std::string> splitAtomicUnitsUtf8(std::string_view text) {
-    std::vector<std::string> out;
-    size_t i = 0;
-    while (i < text.size()) {
-        char c = text[i];
-        if (isHorizontalWs(c)) {
-            size_t start = i;
-            while (i < text.size() && isHorizontalWs(text[i])) {
-                ++i;
-            }
-            out.emplace_back(text.substr(start, i - start));
-        } else if (isAsciiWordChar(static_cast<unsigned char>(c))) {
-            size_t start = i;
-            while (i < text.size() &&
-                   isAsciiWordChar(static_cast<unsigned char>(text[i]))) {
-                ++i;
-            }
-            out.emplace_back(text.substr(start, i - start));
-        } else {
-            size_t step = nextUtf8ScalarBytes(text, i);
-            out.emplace_back(text.substr(i, step));
-            i += step;
-        }
-    }
-    return out;
 }
 
 int unclosedCount(std::string_view s, char open, char close) {
@@ -280,43 +251,14 @@ bool extractJsonStringField(std::string_view line, std::string_view key,
 }
 
 std::vector<std::string> segmentCompletionChunks(std::string_view text) {
-    if (text.empty()) {
-        return {};
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i < text.size()) {
+        size_t step = nextUtf8ScalarBytes(text, i);
+        out.emplace_back(text.substr(i, step));
+        i += step;
     }
-    auto atomic = splitAtomicUnitsUtf8(text);
-    std::vector<std::string> merged;
-    std::string pendingWs;
-
-    for (const auto &piece : atomic) {
-        if (piece.empty()) {
-            continue;
-        }
-        bool allWs = std::all_of(piece.begin(), piece.end(), isHorizontalWs);
-        if (allWs) {
-            pendingWs += piece;
-            continue;
-        }
-        bool allWord =
-            std::all_of(piece.begin(), piece.end(), [](char c) {
-                return isAsciiWordChar(static_cast<unsigned char>(c));
-            });
-        if (pendingWs.empty() && !merged.empty() && allWord &&
-            !merged.back().empty() &&
-            isAsciiWordChar(static_cast<unsigned char>(merged.back().back()))) {
-            merged.back() += piece;
-        } else {
-            merged.push_back(pendingWs + piece);
-            pendingWs.clear();
-        }
-    }
-    if (!pendingWs.empty()) {
-        if (!merged.empty()) {
-            merged.back() += pendingWs;
-        } else {
-            merged.push_back(std::move(pendingWs));
-        }
-    }
-    return merged;
+    return out;
 }
 
 std::string trimSuffixOverlap(std::string_view generated,

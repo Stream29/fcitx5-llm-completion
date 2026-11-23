@@ -10,12 +10,12 @@
   - `online_adapter.{hpp,cpp}`: NPU-resident full-rank FP16 Test-Time Training manager (`online_adapter.bin`) + language-agnostic Bayesian-Shannon `DynamicSuffixMemory` (`online_suffix.bin`, zero hardcoded word lists).
   - `suffix_index.{hpp,cpp}` + `npz_reader.{hpp,cpp}`: Native `zlib` `.npz` loader + Tier-B `PersonalSuffixIndex` (`O(log N)` multi-order suffix retrieval & background unigram/branching priors).
   - `rwkv8_engine.{hpp,cpp}`: Hardware-agnostic `RWKV-8` recurrent state machine, Copy-on-Write speculative rollout, mid-token atomic preemption, and always-display step-0 decoding.
-  - `text_ops.{hpp,cpp}`: Word/character chunking (`segmentCompletionChunks`), bracket-balance-aware FIM suffix deduplication (`trimSuffixOverlap`), hot-reloaded `AppBlacklist`, and `10 MiB × 5` rotating `PredictionLogger`.
+  - `text_ops.{hpp,cpp}`: Strict single-Unicode-codepoint stepping (`segmentCompletionChunks`), bracket-balance-aware FIM suffix deduplication (`trimSuffixOverlap`), hot-reloaded `AppBlacklist`, and `10 MiB × 5` rotating `PredictionLogger`.
 - **`src/backends/`** (`IRwkvStepRunner` single-method NPU hardware abstraction):
   - `openvino_runner.cpp` (Linux `x86_64`): Native OpenVINO C++ Runtime (`openvino::runtime`) targeting `Intel(R) AI Boost` NPU (`NPU -> GPU -> CPU` automatic fallback, `~4.5 ms` TTFT on `< 50 MB` `37.26M` INT8 model).
   - `android_npu_runner.cpp` (Android `arm64-v8a`): Dynamic `QNN HTP / LiteRT / NNAPI ACCELERATOR` NPU runner.
 - **`src/addon/llmcompletion.cpp`** (Self-Contained `libllmcompletion.so` — zero external daemon or socket):
-  - Runs NPU initialization and inference asynchronously on an internal `std::jthread` with lock-free atomic request preemption and `pipe2` `EventLoop` wakeup (`0 ms` main-thread blocking).
+  - Runs NPU initialization and inference asynchronously on an internal `std::thread` with lock-free atomic request preemption and `pipe2` `EventLoop` wakeup (`0 ms` main-thread blocking).
   - Renders proposals via zero-DOM-leak cursor-following `InputPanel` (`setAuxUp("⇥ ...")` on Desktop, `CandidateList` on Android), keeping `clientPreedit` 100% empty.
 
 ## Quick Start (Linux)
@@ -43,7 +43,7 @@ adb install -r dist/org.fcitx.fcitx5.android.plugin.llm_completion-v2.0.0-arm64-
 
 ## Keybindings & Controls
 
-- **`Ctrl + Tab`**: Accept one word/character chunk (auto-chains when final chunk is accepted).
+- **`Ctrl + Tab`**: Accept one Unicode character (auto-chains when final character is accepted).
 - **`Esc`** (or keep typing): Dismiss proposal (records reject state so dismissed text is not repeated).
 - **`Ctrl + Alt + I`** or Fcitx5 tray menu (**内联补全: 开/关**): Toggle on/off.
 - **`~/.config/fcitx5-llm-completion/blacklist.txt`**: One app name per line (`#` comments allowed), hot-reloaded on save.

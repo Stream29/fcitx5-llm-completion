@@ -101,16 +101,19 @@ void testOnlineSamAndBackspace() {
 }
 
 void testChunkerAndSuffixTrim() {
-    std::string txt = "ex那边的specMain";
+    std::string txt = "ex那边的spec🚀";
     auto chunks = segmentCompletionChunks(txt);
     std::string joined;
     for (const auto &c : chunks) {
         joined += c;
     }
     assert(joined == txt);
-    assert(chunks.size() == 5);
-    assert(chunks[0] == "ex");
-    assert(chunks[4] == "specMain");
+    assert(chunks.size() == 10);
+    assert(chunks[0] == "e");
+    assert(chunks[1] == "x");
+    assert(chunks[2] == "那");
+    assert(chunks[5] == "s");
+    assert(chunks[9] == "🚀");
 
     assert(trimSuffixOverlap("移动光标再输入", "再输入，我的") == "移动光标");
     // Preserve closing paren opened inside generated text
