@@ -9,7 +9,7 @@
   - `online_sam.{hpp,cpp}`: Tier-A live session `EventAwareOnlineSAM` (`ROSA` exact cross-app suffix automaton with seamless tombstone backspace rollback and `predictions.jsonl` warm-start).
   - `online_adapter.{hpp,cpp}`: NPU-resident full-rank FP16 Test-Time Training manager (`online_adapter.bin`) + language-agnostic Bayesian-Shannon `DynamicSuffixMemory` (`online_suffix.bin`, zero hardcoded word lists).
   - `suffix_index.{hpp,cpp}` + `npz_reader.{hpp,cpp}`: Native `zlib` `.npz` loader + Tier-B `PersonalSuffixIndex` (`O(log N)` multi-order suffix retrieval & background unigram/branching priors).
-  - `rwkv8_engine.{hpp,cpp}`: Hardware-agnostic `RWKV-8` recurrent state machine, Copy-on-Write speculative rollout, mid-token atomic preemption, and always-display step-0 decoding.
+  - `rwkv8_engine.{hpp,cpp}`: Hardware-agnostic `RWKV-8` continuous character-stream state machine, 8-step `TokenCheckpoint` instant backspace rollback, incremental FIM state reuse, Copy-on-Write speculative rollout, and mid-token atomic preemption.
   - `text_ops.{hpp,cpp}`: Strict single-Unicode-codepoint stepping (`segmentCompletionChunks`), bracket-balance-aware FIM suffix deduplication (`trimSuffixOverlap`), hot-reloaded `AppBlacklist`, and `10 MiB × 5` rotating `PredictionLogger`.
 - **`src/backends/`** (`IRwkvStepRunner` single-method NPU hardware abstraction):
   - `openvino_runner.cpp` (Linux `x86_64`): Native OpenVINO C++ Runtime (`openvino::runtime`) targeting `Intel(R) AI Boost` NPU (`NPU -> GPU -> CPU` automatic fallback, `~4.5 ms` TTFT on `< 50 MB` `37.26M` INT8 model).

@@ -7,6 +7,7 @@
 #include "unicode_codec.hpp"
 
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -74,14 +75,25 @@ public:
                           const std::function<bool()> &shouldAbort = {});
 
 private:
+    static constexpr size_t kMaxCheckpoints = 8;
+
+    struct TokenCheckpoint {
+        RwkvState state;
+        std::vector<float> logits;
+        std::vector<float> xOut;
+        int32_t prevRosaNt = -1;
+        int32_t prevRosaMl = 0;
+        bool hasPrevPredState = false;
+        std::string syncedPrefix;
+    };
+
     bool syncContextWindow(std::string_view prefix, std::string_view sufHead,
                            const std::function<bool()> &shouldAbort);
+    void appendContinuousChars(std::string_view text, float trainLrScale,
+                               float dynWeight);
     void prepareXIn(int32_t tokId, int32_t rosaNt, int32_t rosaMl, float *xOut,
                     float *ennOut) const;
     void stepMainToken(int32_t tokId, int32_t rosaNt, int32_t rosaMl);
-    void feedCommittedTokens(std::span<const int32_t> toks,
-                             float trainLrScale = 0.0f,
-                             float dynWeight = 0.0f);
     void feedRejectedProposal(std::string_view rejectedText);
 
     std::unique_ptr<IRwkvStepRunner> runner_;
@@ -91,16 +103,17 @@ private:
     PersonalSuffixIndex personalIndex_;
     std::unique_ptr<OnlineAdapterManager> onlineAdapter_;
     RwkvState mainState_;
+    std::deque<TokenCheckpoint> checkpoints_;
 
     std::string lastProgram_;
-    std::string lastSyncedTail_;
+    std::string syncedPrefix_;
     std::string lastSyncedSuffixHead_;
+    bool streamPrimed_ = false;
     bool hasSyncedTail_ = false;
     bool hasSyncedSuffix_ = false;
     std::string pendingAnchorPrefix_;
     std::string pendingAnchorSuffix_;
     bool hasPendingAnchor_ = false;
-    bool inTypingRun_ = false;
     bool hasPrevPredState_ = false;
     int32_t prevRosaNt_ = -1;
     int32_t prevRosaMl_ = 0;

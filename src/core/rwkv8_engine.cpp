@@ -11,8 +11,28 @@ namespace fcitx5_llm {
 namespace {
 
 constexpr size_t kSyncPrefixChars = 64;
-constexpr size_t kResyncPrefixAfterBackspaceChars = 32;
+constexpr size_t kTrackedPrefixChars = 96;
 constexpr size_t kSyncSuffixChars = 40;
+
+std::vector<std::string_view> splitUtf8Codepoints(std::string_view s) {
+    std::vector<std::string_view> out;
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char b = static_cast<unsigned char>(s[i]);
+        size_t len = 1;
+        if ((b & 0xE0) == 0xC0) {
+            len = 2;
+        } else if ((b & 0xF0) == 0xE0) {
+            len = 3;
+        } else if ((b & 0xF8) == 0xF0) {
+            len = 4;
+        }
+        len = std::min(len, s.size() - i);
+        out.push_back(s.substr(i, len));
+        i += len;
+    }
+    return out;
+}
 
 std::string extractCanonicalFimSuffixHead(std::string_view rawSuffix) {
     std::string clean = stripInvisibleFormattingUtf8(rawSuffix);
@@ -187,58 +207,70 @@ void Rwkv8CompletionEngine::stepMainToken(int32_t tokId, int32_t rosaNt,
     prevRosaMl_ = rosaMl;
 }
 
-void Rwkv8CompletionEngine::feedCommittedTokens(std::span<const int32_t> toks,
-                                                float trainLrScale,
-                                                float dynWeight) {
-    bool inAfter = false;
-    for (int32_t t : toks) {
-        if (t == TOK_AFTER) {
+void Rwkv8CompletionEngine::appendContinuousChars(std::string_view text,
+                                                  float trainLrScale,
+                                                  float dynWeight) {
+    if (text.empty()) {
+        return;
+    }
+    if (!streamPrimed_) {
+        syncContextWindow("", "", {});
+    }
+
+    auto pushCheckpoint = [&]() {
+        if (checkpoints_.size() >= kMaxCheckpoints) {
+            checkpoints_.pop_front();
+        }
+        checkpoints_.push_back(TokenCheckpoint{
+            mainState_, tmpLogits_, tmpXOut_, prevRosaNt_, prevRosaMl_,
+            hasPrevPredState_, syncedPrefix_});
+    };
+
+    for (std::string_view ch : splitUtf8Codepoints(text)) {
+        auto chToks = codec_.encode(ch);
+        if (ch == "\n") {
+            onlineAdapter_->flushAllPending();
             sam_.boundary();
             dynSuffix_.boundary();
-            hasPrevPredState_ = false;
-            inAfter = true;
-            stepMainToken(t, -1, 0);
-        } else if (t == TOK_FOCUS || t == TOK_BEFORE || t == TOK_END) {
-            sam_.boundary();
-            dynSuffix_.boundary();
-            hasPrevPredState_ = false;
-            inAfter = false;
-            stepMainToken(t, -1, 0);
-            hasPrevPredState_ = true;
-        } else if (t == TOK_TYPE || t == TOK_PREDICT) {
-            inAfter = false;
-            auto m = sam_.queryCurrent();
-            stepMainToken(t, m.nextTok, m.matchLen);
-            hasPrevPredState_ = true;
-        } else if (t == TOK_ACCEPT) {
-            inAfter = false;
-            stepMainToken(t, -1, 0);
-            hasPrevPredState_ = true;
-        } else if (t >= BYTE_OFFSET) {
-            if (inAfter) {
+            for (int32_t t : chToks) {
+                if (t < BYTE_OFFSET) {
+                    continue;
+                }
+                pushCheckpoint();
                 stepMainToken(t, -1, 0);
-                hasPrevPredState_ = false;
-            } else {
-                if (trainLrScale > 0.0f && hasPrevPredState_) {
-                    // Prevent ROSA Shortcut Starvation: if ephemeral SAM already
-                    // injected `t` into base logits, discount that ephemeral shortcut
-                    // so the persistent NPU neural adapter continues learning!
-                    if (prevRosaNt_ == t && prevRosaMl_ >= 2 &&
-                        t < static_cast<int32_t>(tmpLogits_.size())) {
-                        tmpLogits_[static_cast<size_t>(t)] -= 9.0f;
-                    }
-                    onlineAdapter_->enqueueTokenSample(
-                        tmpXOut_.data(), tmpLogits_.data(), t, trainLrScale);
-                }
-                if (dynWeight > 0.0f) {
-                    dynSuffix_.pushToken(t, dynWeight);
-                }
-                auto m = sam_.pushCharTok(t);
-                stepMainToken(t, m.nextTok, m.matchLen);
                 hasPrevPredState_ = true;
             }
+            syncedPrefix_ =
+                utf8TailChars(syncedPrefix_ + "\n", kTrackedPrefixChars);
+            continue;
         }
+
+        for (int32_t t : chToks) {
+            if (t < BYTE_OFFSET) {
+                continue;
+            }
+            pushCheckpoint();
+            if (trainLrScale > 0.0f && hasPrevPredState_) {
+                // Prevent ROSA Shortcut Starvation: discount ephemeral SAM injection
+                // so the persistent NPU neural adapter continues learning!
+                if (prevRosaNt_ == t && prevRosaMl_ >= 2 &&
+                    t < static_cast<int32_t>(tmpLogits_.size())) {
+                    tmpLogits_[static_cast<size_t>(t)] -= 9.0f;
+                }
+                onlineAdapter_->enqueueTokenSample(
+                    tmpXOut_.data(), tmpLogits_.data(), t, trainLrScale);
+            }
+            if (dynWeight > 0.0f) {
+                dynSuffix_.pushToken(t, dynWeight);
+            }
+            auto m = sam_.pushCharTok(t);
+            stepMainToken(t, m.nextTok, m.matchLen);
+            hasPrevPredState_ = true;
+        }
+        syncedPrefix_ = utf8TailChars(syncedPrefix_ + std::string(ch),
+                                      kTrackedPrefixChars);
     }
+    hasSyncedTail_ = true;
 }
 
 void Rwkv8CompletionEngine::feedRejectedProposal(
@@ -246,8 +278,6 @@ void Rwkv8CompletionEngine::feedRejectedProposal(
     if (rejectedText.empty()) {
         return;
     }
-    inTypingRun_ = false;
-    hasPrevPredState_ = false;
     std::string head = utf8HeadChars(rejectedText, 8);
     if (std::find(recentlyRejected_.begin(), recentlyRejected_.end(), head) ==
         recentlyRejected_.end()) {
@@ -263,61 +293,29 @@ void Rwkv8CompletionEngine::feedRejectedProposal(
                                               lastSuggestStep0BaseLogits_.data(),
                                               enc[0]);
     }
-    stepMainToken(TOK_PROPOSE, -1, 0);
-    for (int32_t t : enc) {
-        stepMainToken(t, -1, 0);
-    }
-    stepMainToken(TOK_REJECT, -1, 0);
+    // Intentionally keep mainState_ 100% pure continuous document text without
+    // injecting <PROPOSE>...<REJECT> tokens into the recurrent sliding window.
 }
 
 bool Rwkv8CompletionEngine::syncContextWindow(
     std::string_view prefix, std::string_view sufHead,
     const std::function<bool()> &shouldAbort) {
-    bool needSuffix = (!hasSyncedSuffix_ || sufHead != lastSyncedSuffixHead_);
-    size_t preLimit = (!needSuffix && !hasSyncedTail_)
-                          ? kResyncPrefixAfterBackspaceChars
-                          : kSyncPrefixChars;
-    std::string preWin = utf8TailChars(prefix, preLimit);
     std::string tailCheck = utf8TailChars(prefix, 16);
-
-    if (!needSuffix && hasSyncedTail_ && tailCheck == lastSyncedTail_) {
+    if (streamPrimed_ && hasSyncedTail_ && hasSyncedSuffix_ &&
+        tailCheck == utf8TailChars(syncedPrefix_, 16) &&
+        sufHead == lastSyncedSuffixHead_) {
         hasPendingAnchor_ = false;
         return true;
     }
 
-    std::vector<int32_t> sEnc;
-    if (needSuffix && !sufHead.empty()) {
-        sEnc = codec_.encode(sufHead);
-    }
-    std::vector<int32_t> pEnc;
-    if (!preWin.empty()) {
-        pEnc = codec_.encode(preWin);
-    }
-    bool needEmptyBeforeReset =
-        (needSuffix && !lastSyncedSuffixHead_.empty() && sufHead.empty() &&
-         pEnc.empty());
-
-    if (sEnc.empty() && pEnc.empty() && !needEmptyBeforeReset) {
-        sam_.boundary();
-        dynSuffix_.boundary();
-        inTypingRun_ = false;
-        hasPrevPredState_ = false;
-        lastSyncedTail_.clear();
-        lastSyncedSuffixHead_ = std::string(sufHead);
-        hasSyncedTail_ = true;
-        hasSyncedSuffix_ = true;
-        hasPendingAnchor_ = false;
-        return true;
-    }
-
-    RwkvState nextState = mainState_;
-    std::vector<float> nextLogits = tmpLogits_;
-    std::vector<float> nextXOut = tmpXOut_;
-    int32_t nextPrevNt = prevRosaNt_;
-    int32_t nextPrevMl = prevRosaMl_;
-
-    sam_.boundary();
-    dynSuffix_.boundary();
+    const auto &cfg = runner_->config();
+    RwkvState nextState = RwkvState::createZero(cfg);
+    std::vector<float> nextLogits(static_cast<size_t>(cfg.vocabSize), 0.0f);
+    std::vector<float> nextXOut(static_cast<size_t>(cfg.nEmbd), 0.0f);
+    int32_t nextPrevNt = -1;
+    int32_t nextPrevMl = 0;
+    bool nextHasPrevPred = false;
+    std::deque<TokenCheckpoint> nextCheckpoints;
 
     auto stepTx = [&](int32_t tokId, int32_t rosaNt, int32_t rosaMl) -> bool {
         if (shouldAbort && shouldAbort()) {
@@ -331,45 +329,114 @@ bool Rwkv8CompletionEngine::syncContextWindow(
         return true;
     };
 
-    if (!sEnc.empty()) {
+    if (!lastProgram_.empty()) {
+        if (!stepTx(TOK_FOCUS, -1, 0)) {
+            return false;
+        }
+        for (int32_t ft : codec_.encode(lastProgram_ + "\n")) {
+            if (!stepTx(ft, -1, 0)) {
+                return false;
+            }
+        }
+    }
+
+    sam_.boundary();
+    dynSuffix_.boundary();
+
+    if (!sufHead.empty()) {
         if (!stepTx(TOK_AFTER, -1, 0)) {
             sam_.boundary();
             return false;
         }
-        for (int32_t t : sEnc) {
-            if (!stepTx(t, -1, 0)) {
+        for (int32_t st : codec_.encode(sufHead)) {
+            if (!stepTx(st, -1, 0)) {
                 sam_.boundary();
                 return false;
             }
         }
-    }
-
-    if (!pEnc.empty() || needEmptyBeforeReset) {
         if (!stepTx(TOK_BEFORE, -1, 0)) {
             sam_.boundary();
             return false;
         }
-        for (int32_t t : pEnc) {
-            if (shouldAbort && shouldAbort()) {
-                sam_.boundary();
-                return false;
+        nextHasPrevPred = true;
+    } else {
+        auto m0 = sam_.queryCurrent();
+        if (!stepTx(TOK_TYPE, m0.nextTok, m0.matchLen)) {
+            sam_.boundary();
+            return false;
+        }
+        nextHasPrevPred = true;
+    }
+
+    std::string preWin = utf8TailChars(prefix, kSyncPrefixChars);
+    std::string runningPre =
+        (prefix.size() > preWin.size())
+            ? utf8TailChars(prefix.substr(0, prefix.size() - preWin.size()),
+                            kTrackedPrefixChars)
+            : std::string{};
+    auto preChars = splitUtf8Codepoints(preWin);
+    for (size_t idx = 0; idx < preChars.size(); ++idx) {
+        std::string_view ch = preChars[idx];
+        bool saveCkpt = (idx + kMaxCheckpoints >= preChars.size());
+        auto chToks = codec_.encode(ch);
+        if (ch == "\n") {
+            sam_.boundary();
+            for (int32_t t : chToks) {
+                if (t < BYTE_OFFSET) {
+                    continue;
+                }
+                if (saveCkpt) {
+                    if (nextCheckpoints.size() >= kMaxCheckpoints) {
+                        nextCheckpoints.pop_front();
+                    }
+                    nextCheckpoints.push_back(TokenCheckpoint{
+                        nextState, nextLogits, nextXOut, nextPrevNt, nextPrevMl,
+                        nextHasPrevPred, runningPre});
+                }
+                if (!stepTx(t, -1, 0)) {
+                    sam_.boundary();
+                    return false;
+                }
+                nextHasPrevPred = true;
             }
-            auto m = sam_.pushCharTok(t);
-            if (!stepTx(t, m.nextTok, m.matchLen)) {
-                sam_.boundary();
-                return false;
+        } else {
+            for (int32_t t : chToks) {
+                if (t < BYTE_OFFSET) {
+                    continue;
+                }
+                if (saveCkpt) {
+                    if (nextCheckpoints.size() >= kMaxCheckpoints) {
+                        nextCheckpoints.pop_front();
+                    }
+                    nextCheckpoints.push_back(TokenCheckpoint{
+                        nextState, nextLogits, nextXOut, nextPrevNt, nextPrevMl,
+                        nextHasPrevPred, runningPre});
+                }
+                if (shouldAbort && shouldAbort()) {
+                    sam_.boundary();
+                    return false;
+                }
+                auto m = sam_.pushCharTok(t);
+                if (!stepTx(t, m.nextTok, m.matchLen)) {
+                    sam_.boundary();
+                    return false;
+                }
+                nextHasPrevPred = true;
             }
         }
+        runningPre =
+            utf8TailChars(runningPre + std::string(ch), kTrackedPrefixChars);
     }
 
     mainState_ = std::move(nextState);
+    checkpoints_ = std::move(nextCheckpoints);
     tmpLogits_ = std::move(nextLogits);
     tmpXOut_ = std::move(nextXOut);
     prevRosaNt_ = nextPrevNt;
     prevRosaMl_ = nextPrevMl;
-    inTypingRun_ = false;
-    hasPrevPredState_ = !pEnc.empty();
-    lastSyncedTail_ = std::move(tailCheck);
+    hasPrevPredState_ = nextHasPrevPred;
+    streamPrimed_ = true;
+    syncedPrefix_ = utf8TailChars(prefix, kTrackedPrefixChars);
     lastSyncedSuffixHead_ = std::string(sufHead);
     hasSyncedTail_ = true;
     hasSyncedSuffix_ = true;
@@ -392,15 +459,13 @@ void Rwkv8CompletionEngine::handleEvent(
     if (!ev.program.empty() && ev.program != lastProgram_) {
         onlineAdapter_->flushAllPending();
         lastProgram_ = ev.program;
-        inTypingRun_ = false;
+        streamPrimed_ = false;
         hasSyncedTail_ = false;
         hasSyncedSuffix_ = false;
-        lastSyncedTail_.clear();
+        syncedPrefix_.clear();
         lastSyncedSuffixHead_.clear();
+        checkpoints_.clear();
         hasPendingAnchor_ = false;
-        auto focusToks = codec_.encode(ev.program + "\n");
-        focusToks.insert(focusToks.begin(), TOK_FOCUS);
-        feedCommittedTokens(focusToks, 0.0f, 0.0f);
     }
 
     if (ev.event == "focus_in" || ev.event == "cursor_jump") {
@@ -408,17 +473,20 @@ void Rwkv8CompletionEngine::handleEvent(
         std::string sufHead = extractCanonicalFimSuffixHead(ev.suffix);
         std::string cleanPre = stripInvisibleFormattingUtf8(ev.prefix);
         std::string tailCheck = utf8TailChars(cleanPre, 16);
-        if (!hasPendingAnchor_ && hasSyncedTail_ && hasSyncedSuffix_ &&
-            tailCheck == lastSyncedTail_ && sufHead == lastSyncedSuffixHead_) {
+        if (!hasPendingAnchor_ && streamPrimed_ && hasSyncedTail_ &&
+            hasSyncedSuffix_ &&
+            tailCheck == utf8TailChars(syncedPrefix_, 16) &&
+            sufHead == lastSyncedSuffixHead_) {
             return;
         }
         sam_.boundary();
         dynSuffix_.boundary();
-        inTypingRun_ = false;
+        streamPrimed_ = false;
         hasPrevPredState_ = false;
         hasSyncedTail_ = false;
         hasSyncedSuffix_ = false;
-        pendingAnchorPrefix_ = utf8TailChars(cleanPre, kSyncPrefixChars);
+        checkpoints_.clear();
+        pendingAnchorPrefix_ = utf8TailChars(cleanPre, kTrackedPrefixChars);
         pendingAnchorSuffix_ = std::move(sufHead);
         hasPendingAnchor_ = true;
     } else if (ev.event == "backspace") {
@@ -429,39 +497,40 @@ void Rwkv8CompletionEngine::handleEvent(
         sam_.tombstoneBackspace(nDel);
         dynSuffix_.rollbackBackspace(nDel);
         onlineAdapter_->rollbackPending(nDel);
-        inTypingRun_ = false;
-        hasPrevPredState_ = false;
-        hasPendingAnchor_ = false;
-        hasSyncedTail_ = false;
-        lastSyncedTail_.clear();
+
+        if (hasPendingAnchor_) {
+            popLastUtf8Char(pendingAnchorPrefix_);
+        } else if (streamPrimed_ && hasSyncedTail_ &&
+                   checkpoints_.size() >= static_cast<size_t>(nDel)) {
+            for (int k = 0; k + 1 < nDel; ++k) {
+                checkpoints_.pop_back();
+            }
+            auto ckpt = std::move(checkpoints_.back());
+            checkpoints_.pop_back();
+            mainState_ = std::move(ckpt.state);
+            tmpLogits_ = std::move(ckpt.logits);
+            tmpXOut_ = std::move(ckpt.xOut);
+            prevRosaNt_ = ckpt.prevRosaNt;
+            prevRosaMl_ = ckpt.prevRosaMl;
+            hasPrevPredState_ = ckpt.hasPrevPredState;
+            syncedPrefix_ = std::move(ckpt.syncedPrefix);
+            hasSyncedTail_ = true;
+        } else {
+            checkpoints_.clear();
+            streamPrimed_ = false;
+            hasPrevPredState_ = false;
+            hasSyncedTail_ = false;
+            syncedPrefix_.clear();
+        }
     } else if (ev.event == "user_type") {
         std::string txt = stripInvisibleFormattingUtf8(ev.text);
         if (!txt.empty()) {
             if (hasPendingAnchor_) {
-                prewarmPendingContext(shouldAbort);
-            }
-            if (txt == "\n") {
-                onlineAdapter_->flushAllPending();
-                sam_.boundary();
-                dynSuffix_.boundary();
-                auto enc = codec_.encode(txt);
-                if (!inTypingRun_) {
-                    enc.insert(enc.begin(), TOK_TYPE);
-                    inTypingRun_ = true;
+                if (!prewarmPendingContext(shouldAbort)) {
+                    return;
                 }
-                feedCommittedTokens(enc, 0.0f, 0.0f);
-                inTypingRun_ = false;
-            } else {
-                auto enc = codec_.encode(txt);
-                if (!inTypingRun_) {
-                    enc.insert(enc.begin(), TOK_TYPE);
-                    inTypingRun_ = true;
-                }
-                feedCommittedTokens(enc, 1.0f, 1.0f);
             }
-            if (hasSyncedTail_) {
-                lastSyncedTail_ = utf8TailChars(lastSyncedTail_ + txt, 16);
-            }
+            appendContinuousChars(txt, 1.0f, 1.0f);
             recentlyRejected_.clear();
         }
     } else if (ev.event == "accept_chunk" || ev.event == "accept_word" ||
@@ -469,30 +538,27 @@ void Rwkv8CompletionEngine::handleEvent(
         std::string acc = stripInvisibleFormattingUtf8(ev.accepted);
         if (!acc.empty()) {
             if (hasPendingAnchor_) {
-                prewarmPendingContext(shouldAbort);
+                if (!prewarmPendingContext(shouldAbort)) {
+                    return;
+                }
             }
-            auto enc = codec_.encode(acc);
-            enc.push_back(TOK_ACCEPT);
-            feedCommittedTokens(enc, 1.9f, 2.5f);
+            // Feed accepted characters as pure continuous Unicode text (zero <ACCEPT>
+            // fragmentation), boosting online learning weights!
+            appendContinuousChars(acc, 1.9f, 2.5f);
             onlineAdapter_->flushAllPending();
-            inTypingRun_ = true;
-            if (hasSyncedTail_) {
-                lastSyncedTail_ = utf8TailChars(lastSyncedTail_ + acc, 16);
-            }
             recentlyRejected_.clear();
         }
     } else if (ev.event == "dismiss_esc" || ev.event == "dismiss_escape") {
-        // Explicit Esc rejection: penalize adapter on NPU and mark <PROPOSE>...<REJECT>
         std::string rem = stripInvisibleFormattingUtf8(ev.remaining);
         if (!rem.empty()) {
             if (hasPendingAnchor_) {
-                prewarmPendingContext(shouldAbort);
+                if (!prewarmPendingContext(shouldAbort)) {
+                    return;
+                }
             }
             feedRejectedProposal(rem);
         }
     }
-    // Note: normal continued typing ("dismiss_key") intentionally keeps mainState_
-    // and inTypingRun_ 100% pure without injecting <PROPOSE>...<REJECT> noise.
 }
 
 SuggestOutput Rwkv8CompletionEngine::suggest(
@@ -523,20 +589,19 @@ SuggestOutput Rwkv8CompletionEngine::suggest(
     if (!params.program.empty() && params.program != lastProgram_) {
         onlineAdapter_->flushAllPending();
         lastProgram_ = params.program;
-        inTypingRun_ = false;
+        streamPrimed_ = false;
         hasSyncedTail_ = false;
         hasSyncedSuffix_ = false;
-        lastSyncedTail_.clear();
+        syncedPrefix_.clear();
         lastSyncedSuffixHead_.clear();
+        checkpoints_.clear();
         hasPendingAnchor_ = false;
-        auto focusToks = codec_.encode(params.program + "\n");
-        focusToks.insert(focusToks.begin(), TOK_FOCUS);
-        feedCommittedTokens(focusToks, 0.0f, 0.0f);
     }
 
     hasPendingAnchor_ = false;
     std::string tailCheck = utf8TailChars(prefix, 16);
-    if (!hasSyncedTail_ || tailCheck != lastSyncedTail_ || !hasSyncedSuffix_ ||
+    if (!streamPrimed_ || !hasSyncedTail_ ||
+        tailCheck != utf8TailChars(syncedPrefix_, 16) || !hasSyncedSuffix_ ||
         sufHead != lastSyncedSuffixHead_) {
         if (!syncContextWindow(prefix, sufHead, shouldAbort)) {
             out.cancelled = true;

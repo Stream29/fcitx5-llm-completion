@@ -354,6 +354,61 @@ void testLiveNpuInferenceIfPresent() {
             assert(fimOut2.text.starts_with("星轨"));
         }
 
+        // Test 2.7: Anti-Fragmentation Invariant — Typo + 8-Step Checkpoint Backspace + Per-Char accept_chunk == Pure Continuous Stream!
+        {
+            std::filesystem::path tmpCleanA =
+                tmpAdapter.string() + ".cleanA";
+            std::filesystem::path tmpCleanB =
+                tmpAdapter.string() + ".cleanB";
+            std::filesystem::remove(tmpCleanA, ec);
+            std::filesystem::remove(tmpCleanA.string() + ".suffix", ec);
+            std::filesystem::remove(tmpCleanB, ec);
+            std::filesystem::remove(tmpCleanB.string() + ".suffix", ec);
+
+            Rwkv8CompletionEngine engFrag(
+                createPlatformNpuRunner(modelDir, cacheDir, "NPU"), modelDir,
+                {}, tmpCleanA);
+            Rwkv8CompletionEngine engPure(
+                createPlatformNpuRunner(modelDir, cacheDir, "NPU"), modelDir,
+                {}, tmpCleanB);
+
+            engFrag.handleEvent({"focus_in", "gnome-shell", "", "", "", "", ""});
+            engFrag.handleEvent({"user_type", "gnome-shell", "", "",
+                                 "今天天气真不错，我们一错字", "", ""});
+            engFrag.handleEvent({"backspace", "gnome-shell", "", "", "字", "", ""});
+            engFrag.handleEvent({"backspace", "gnome-shell", "", "", "错", "", ""});
+            // Post-backspace Wayland cursor_jump echo with matching prefix must be a 0ms no-op!
+            engFrag.handleEvent({"cursor_jump", "gnome-shell",
+                                 "今天天气真不错，我们一", "", "", "", ""});
+            assert(!engFrag.hasPendingContext());
+            engFrag.handleEvent({"user_type", "gnome-shell", "", "", "起", "", ""});
+            for (const char *ch : {"去", "公", "园"}) {
+                engFrag.handleEvent(
+                    {"accept_chunk", "gnome-shell", "", "", "", ch, ""});
+            }
+            auto outFrag = engFrag.suggest(
+                {"gnome-shell", "今天天气真不错，我们一起去公园", "", 10});
+
+            engPure.handleEvent({"focus_in", "gnome-shell", "", "", "", "", ""});
+            engPure.handleEvent({"user_type", "gnome-shell", "", "",
+                                 "今天天气真不错，我们一起去公园", "", ""});
+            auto outPure = engPure.suggest(
+                {"gnome-shell", "今天天气真不错，我们一起去公园", "", 10});
+
+            std::cout << "[NPU Anti-Fragmentation] frag='" << outFrag.text
+                      << "' (ttft=" << outFrag.ttftMs << "ms) vs pure='"
+                      << outPure.text << "'\n";
+            assert(outFrag.ttftMs <= 25);
+            assert(!outFrag.text.empty());
+            assert(!outFrag.text.starts_with("，"));
+            assert(outFrag.text == outPure.text);
+
+            std::filesystem::remove(tmpCleanA, ec);
+            std::filesystem::remove(tmpCleanA.string() + ".suffix", ec);
+            std::filesystem::remove(tmpCleanB, ec);
+            std::filesystem::remove(tmpCleanB.string() + ".suffix", ec);
+        }
+
         // Test mid-rollout atomic cancellation
         int calls = 0;
         auto cancelledOut =
