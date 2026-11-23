@@ -291,6 +291,69 @@ void testLiveNpuInferenceIfPresent() {
         engine.flushOnlineLearning();
         assert(std::filesystem::is_regular_file(tmpSuffix, ec));
 
+        // Test 2.6: Coalesced cursor_jump + Incremental FIM state reuse (~8ms TTFT vs ~650ms)
+        {
+            using Clock = std::chrono::steady_clock;
+            std::string longPre(180, 'a');
+            longPre += "正在编辑中间段落：代号";
+            std::string longSuf =
+                "，后续还有很长一段正文内容用于验证FIM增量状态复用延迟表现。";
+            for (int k = 0; k < 4; ++k) {
+                longSuf += longSuf;
+            }
+            auto tJump0 = Clock::now();
+            for (int j = 0; j < 10; ++j) {
+                InteractionEvent cj;
+                cj.event = "cursor_jump";
+                cj.program = "kitty";
+                cj.prefix = longPre.substr(0, longPre.size() - (9 - j));
+                cj.suffix = longSuf;
+                engine.handleEvent(cj);
+            }
+            auto jumpBatchMs =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - tJump0)
+                    .count();
+            std::cout << "[NPU 10x cursor_jump lazy enqueue] " << jumpBatchMs
+                      << "ms\n";
+            assert(jumpBatchMs <= 5);
+            assert(engine.hasPendingContext());
+
+            // Aborted prewarm leaves pending context intact
+            int pwSteps = 0;
+            bool pwDone =
+                engine.prewarmPendingContext([&]() { return (++pwSteps) >= 3; });
+            assert(!pwDone);
+            assert(engine.hasPendingContext());
+
+            // Full idle prewarm succeeds
+            assert(engine.prewarmPendingContext());
+            assert(!engine.hasPendingContext());
+
+            // Incremental FIM keystroke: must reuse mainState_ with single-step <PREDICT> (~8ms TTFT!)
+            typeStr("沧");
+            std::string curFimPre = longPre + "沧";
+            auto fimOut1 = engine.suggest({"kitty", curFimPre, longSuf, 8});
+            std::cout << "[NPU Incremental FIM #1] mode=" << fimOut1.mode
+                      << " ttft=" << fimOut1.ttftMs
+                      << "ms latency=" << fimOut1.latencyMs << "ms -> '"
+                      << fimOut1.text << "'\n";
+            assert(fimOut1.mode == "fim");
+            assert(fimOut1.ttftMs <= 25);
+            assert(fimOut1.text.starts_with("溟星轨"));
+
+            typeStr("溟");
+            curFimPre += "溟";
+            auto fimOut2 = engine.suggest({"kitty", curFimPre, longSuf, 8});
+            std::cout << "[NPU Incremental FIM #2] mode=" << fimOut2.mode
+                      << " ttft=" << fimOut2.ttftMs
+                      << "ms latency=" << fimOut2.latencyMs << "ms -> '"
+                      << fimOut2.text << "'\n";
+            assert(fimOut2.mode == "fim");
+            assert(fimOut2.ttftMs <= 25);
+            assert(fimOut2.text.starts_with("星轨"));
+        }
+
         // Test mid-rollout atomic cancellation
         int calls = 0;
         auto cancelledOut =

@@ -66,11 +66,16 @@ public:
         dynSuffix_.saveIfDirty();
     }
 
-    void handleEvent(const InteractionEvent &ev);
+    void handleEvent(const InteractionEvent &ev,
+                     const std::function<bool()> &shouldAbort = {});
+    bool hasPendingContext() const { return hasPendingAnchor_; }
+    bool prewarmPendingContext(const std::function<bool()> &shouldAbort = {});
     SuggestOutput suggest(const SuggestParams &params,
                           const std::function<bool()> &shouldAbort = {});
 
 private:
+    bool syncContextWindow(std::string_view prefix, std::string_view sufHead,
+                           const std::function<bool()> &shouldAbort);
     void prepareXIn(int32_t tokId, int32_t rosaNt, int32_t rosaMl, float *xOut,
                     float *ennOut) const;
     void stepMainToken(int32_t tokId, int32_t rosaNt, int32_t rosaMl);
@@ -89,7 +94,12 @@ private:
 
     std::string lastProgram_;
     std::string lastSyncedTail_;
+    std::string lastSyncedSuffixHead_;
     bool hasSyncedTail_ = false;
+    bool hasSyncedSuffix_ = false;
+    std::string pendingAnchorPrefix_;
+    std::string pendingAnchorSuffix_;
+    bool hasPendingAnchor_ = false;
     bool inTypingRun_ = false;
     bool hasPrevPredState_ = false;
     int32_t prevRosaNt_ = -1;

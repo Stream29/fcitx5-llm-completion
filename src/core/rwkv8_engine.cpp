@@ -10,6 +10,19 @@ namespace fcitx5_llm {
 
 namespace {
 
+constexpr size_t kSyncPrefixChars = 64;
+constexpr size_t kResyncPrefixAfterBackspaceChars = 32;
+constexpr size_t kSyncSuffixChars = 40;
+
+std::string extractCanonicalFimSuffixHead(std::string_view rawSuffix) {
+    std::string clean = stripInvisibleFormattingUtf8(rawSuffix);
+    std::string head = utf8HeadChars(clean, kSyncSuffixChars);
+    if (trimWhitespace(head).empty()) {
+        return {};
+    }
+    return head;
+}
+
 bool hasNgramRepeat(std::span<const int32_t> ids) {
     size_t n = ids.size();
     if (n >= 3 && ids[n - 1] == ids[n - 2] && ids[n - 2] == ids[n - 3]) {
@@ -257,11 +270,134 @@ void Rwkv8CompletionEngine::feedRejectedProposal(
     stepMainToken(TOK_REJECT, -1, 0);
 }
 
-void Rwkv8CompletionEngine::handleEvent(const InteractionEvent &ev) {
+bool Rwkv8CompletionEngine::syncContextWindow(
+    std::string_view prefix, std::string_view sufHead,
+    const std::function<bool()> &shouldAbort) {
+    bool needSuffix = (!hasSyncedSuffix_ || sufHead != lastSyncedSuffixHead_);
+    size_t preLimit = (!needSuffix && !hasSyncedTail_)
+                          ? kResyncPrefixAfterBackspaceChars
+                          : kSyncPrefixChars;
+    std::string preWin = utf8TailChars(prefix, preLimit);
+    std::string tailCheck = utf8TailChars(prefix, 16);
+
+    if (!needSuffix && hasSyncedTail_ && tailCheck == lastSyncedTail_) {
+        hasPendingAnchor_ = false;
+        return true;
+    }
+
+    std::vector<int32_t> sEnc;
+    if (needSuffix && !sufHead.empty()) {
+        sEnc = codec_.encode(sufHead);
+    }
+    std::vector<int32_t> pEnc;
+    if (!preWin.empty()) {
+        pEnc = codec_.encode(preWin);
+    }
+    bool needEmptyBeforeReset =
+        (needSuffix && !lastSyncedSuffixHead_.empty() && sufHead.empty() &&
+         pEnc.empty());
+
+    if (sEnc.empty() && pEnc.empty() && !needEmptyBeforeReset) {
+        sam_.boundary();
+        dynSuffix_.boundary();
+        inTypingRun_ = false;
+        hasPrevPredState_ = false;
+        lastSyncedTail_.clear();
+        lastSyncedSuffixHead_ = std::string(sufHead);
+        hasSyncedTail_ = true;
+        hasSyncedSuffix_ = true;
+        hasPendingAnchor_ = false;
+        return true;
+    }
+
+    RwkvState nextState = mainState_;
+    std::vector<float> nextLogits = tmpLogits_;
+    std::vector<float> nextXOut = tmpXOut_;
+    int32_t nextPrevNt = prevRosaNt_;
+    int32_t nextPrevMl = prevRosaMl_;
+
+    sam_.boundary();
+    dynSuffix_.boundary();
+
+    auto stepTx = [&](int32_t tokId, int32_t rosaNt, int32_t rosaMl) -> bool {
+        if (shouldAbort && shouldAbort()) {
+            return false;
+        }
+        prepareXIn(tokId, rosaNt, rosaMl, tmpXIn_.data(), tmpEnn_.data());
+        runner_->inferStep(tmpXIn_.data(), tmpEnn_.data(), nextState,
+                           nextLogits.data(), nextXOut.data());
+        nextPrevNt = rosaNt;
+        nextPrevMl = rosaMl;
+        return true;
+    };
+
+    if (!sEnc.empty()) {
+        if (!stepTx(TOK_AFTER, -1, 0)) {
+            sam_.boundary();
+            return false;
+        }
+        for (int32_t t : sEnc) {
+            if (!stepTx(t, -1, 0)) {
+                sam_.boundary();
+                return false;
+            }
+        }
+    }
+
+    if (!pEnc.empty() || needEmptyBeforeReset) {
+        if (!stepTx(TOK_BEFORE, -1, 0)) {
+            sam_.boundary();
+            return false;
+        }
+        for (int32_t t : pEnc) {
+            if (shouldAbort && shouldAbort()) {
+                sam_.boundary();
+                return false;
+            }
+            auto m = sam_.pushCharTok(t);
+            if (!stepTx(t, m.nextTok, m.matchLen)) {
+                sam_.boundary();
+                return false;
+            }
+        }
+    }
+
+    mainState_ = std::move(nextState);
+    tmpLogits_ = std::move(nextLogits);
+    tmpXOut_ = std::move(nextXOut);
+    prevRosaNt_ = nextPrevNt;
+    prevRosaMl_ = nextPrevMl;
+    inTypingRun_ = false;
+    hasPrevPredState_ = !pEnc.empty();
+    lastSyncedTail_ = std::move(tailCheck);
+    lastSyncedSuffixHead_ = std::string(sufHead);
+    hasSyncedTail_ = true;
+    hasSyncedSuffix_ = true;
+    hasPendingAnchor_ = false;
+    return true;
+}
+
+bool Rwkv8CompletionEngine::prewarmPendingContext(
+    const std::function<bool()> &shouldAbort) {
+    if (!hasPendingAnchor_) {
+        return true;
+    }
+    std::string pre = pendingAnchorPrefix_;
+    std::string suf = pendingAnchorSuffix_;
+    return syncContextWindow(pre, suf, shouldAbort);
+}
+
+void Rwkv8CompletionEngine::handleEvent(
+    const InteractionEvent &ev, const std::function<bool()> &shouldAbort) {
     if (!ev.program.empty() && ev.program != lastProgram_) {
         onlineAdapter_->flushAllPending();
         lastProgram_ = ev.program;
         inTypingRun_ = false;
+        hasSyncedTail_ = false;
+        hasSyncedSuffix_ = false;
+        lastSyncedTail_.clear();
+        lastSyncedSuffixHead_.clear();
+        hasPendingAnchor_ = false;
         auto focusToks = codec_.encode(ev.program + "\n");
         focusToks.insert(focusToks.begin(), TOK_FOCUS);
         feedCommittedTokens(focusToks, 0.0f, 0.0f);
@@ -269,34 +405,22 @@ void Rwkv8CompletionEngine::handleEvent(const InteractionEvent &ev) {
 
     if (ev.event == "focus_in" || ev.event == "cursor_jump") {
         onlineAdapter_->flushAllPending();
+        std::string sufHead = extractCanonicalFimSuffixHead(ev.suffix);
+        std::string cleanPre = stripInvisibleFormattingUtf8(ev.prefix);
+        std::string tailCheck = utf8TailChars(cleanPre, 16);
+        if (!hasPendingAnchor_ && hasSyncedTail_ && hasSyncedSuffix_ &&
+            tailCheck == lastSyncedTail_ && sufHead == lastSyncedSuffixHead_) {
+            return;
+        }
         sam_.boundary();
         dynSuffix_.boundary();
         inTypingRun_ = false;
         hasPrevPredState_ = false;
-        std::string rawSuf = stripInvisibleFormattingUtf8(ev.suffix);
-        std::string suf =
-            trimWhitespace(rawSuf).empty() ? "" : utf8HeadChars(rawSuf, 48);
-        std::string pre =
-            utf8TailChars(stripInvisibleFormattingUtf8(ev.prefix), 96);
-
-        std::vector<int32_t> seq;
-        if (!suf.empty()) {
-            seq.push_back(TOK_AFTER);
-            auto sEnc = codec_.encode(suf);
-            seq.insert(seq.end(), sEnc.begin(), sEnc.end());
-        }
-        if (!pre.empty()) {
-            seq.push_back(TOK_BEFORE);
-            auto pEnc = codec_.encode(pre);
-            seq.insert(seq.end(), pEnc.begin(), pEnc.end());
-            lastSyncedTail_ = utf8TailChars(pre, 16);
-        } else {
-            lastSyncedTail_.clear();
-        }
-        hasSyncedTail_ = true;
-        if (!seq.empty()) {
-            feedCommittedTokens(seq, 0.0f, 0.0f);
-        }
+        hasSyncedTail_ = false;
+        hasSyncedSuffix_ = false;
+        pendingAnchorPrefix_ = utf8TailChars(cleanPre, kSyncPrefixChars);
+        pendingAnchorSuffix_ = std::move(sufHead);
+        hasPendingAnchor_ = true;
     } else if (ev.event == "backspace") {
         std::string del = stripInvisibleFormattingUtf8(ev.text);
         int nDel = del.empty()
@@ -307,11 +431,15 @@ void Rwkv8CompletionEngine::handleEvent(const InteractionEvent &ev) {
         onlineAdapter_->rollbackPending(nDel);
         inTypingRun_ = false;
         hasPrevPredState_ = false;
+        hasPendingAnchor_ = false;
         hasSyncedTail_ = false;
         lastSyncedTail_.clear();
     } else if (ev.event == "user_type") {
         std::string txt = stripInvisibleFormattingUtf8(ev.text);
         if (!txt.empty()) {
+            if (hasPendingAnchor_) {
+                prewarmPendingContext(shouldAbort);
+            }
             if (txt == "\n") {
                 onlineAdapter_->flushAllPending();
                 sam_.boundary();
@@ -340,6 +468,9 @@ void Rwkv8CompletionEngine::handleEvent(const InteractionEvent &ev) {
                ev.event == "accept_all") {
         std::string acc = stripInvisibleFormattingUtf8(ev.accepted);
         if (!acc.empty()) {
+            if (hasPendingAnchor_) {
+                prewarmPendingContext(shouldAbort);
+            }
             auto enc = codec_.encode(acc);
             enc.push_back(TOK_ACCEPT);
             feedCommittedTokens(enc, 1.9f, 2.5f);
@@ -354,6 +485,9 @@ void Rwkv8CompletionEngine::handleEvent(const InteractionEvent &ev) {
         // Explicit Esc rejection: penalize adapter on NPU and mark <PROPOSE>...<REJECT>
         std::string rem = stripInvisibleFormattingUtf8(ev.remaining);
         if (!rem.empty()) {
+            if (hasPendingAnchor_) {
+                prewarmPendingContext(shouldAbort);
+            }
             feedRejectedProposal(rem);
         }
     }
@@ -370,9 +504,12 @@ SuggestOutput Rwkv8CompletionEngine::suggest(
     out.model = runner_->modelLabel();
 
     std::string prefix = stripInvisibleFormattingUtf8(params.prefix);
-    std::string rawSuffix = stripInvisibleFormattingUtf8(params.suffix);
-    std::string suffix = trimWhitespace(rawSuffix).empty() ? "" : rawSuffix;
-    out.mode = suffix.empty() ? "tail" : "fim";
+    std::string sufHead = extractCanonicalFimSuffixHead(params.suffix);
+    bool hasFimSuffix = !sufHead.empty();
+    std::string suffix = hasFimSuffix
+                             ? stripInvisibleFormattingUtf8(params.suffix)
+                             : std::string{};
+    out.mode = hasFimSuffix ? "fim" : "tail";
     int32_t maxChars = std::clamp(params.maxTokens, 4, 14);
 
     if (prefix.empty()) {
@@ -387,21 +524,24 @@ SuggestOutput Rwkv8CompletionEngine::suggest(
         onlineAdapter_->flushAllPending();
         lastProgram_ = params.program;
         inTypingRun_ = false;
+        hasSyncedTail_ = false;
+        hasSyncedSuffix_ = false;
+        lastSyncedTail_.clear();
+        lastSyncedSuffixHead_.clear();
+        hasPendingAnchor_ = false;
         auto focusToks = codec_.encode(params.program + "\n");
         focusToks.insert(focusToks.begin(), TOK_FOCUS);
         feedCommittedTokens(focusToks, 0.0f, 0.0f);
     }
 
-    bool hasFimSuffix = !suffix.empty();
+    hasPendingAnchor_ = false;
     std::string tailCheck = utf8TailChars(prefix, 16);
-
-    if (!hasFimSuffix && (!hasSyncedTail_ || tailCheck != lastSyncedTail_)) {
-        auto syncSeq = codec_.encode(utf8TailChars(prefix, 96));
-        syncSeq.insert(syncSeq.begin(), TOK_BEFORE);
-        feedCommittedTokens(syncSeq, 0.0f, 0.0f);
-        inTypingRun_ = false;
-        lastSyncedTail_ = tailCheck;
-        hasSyncedTail_ = true;
+    if (!hasSyncedTail_ || tailCheck != lastSyncedTail_ || !hasSyncedSuffix_ ||
+        sufHead != lastSyncedSuffixHead_) {
+        if (!syncContextWindow(prefix, sufHead, shouldAbort)) {
+            out.cancelled = true;
+            return out;
+        }
     }
 
     if (shouldAbort && shouldAbort()) {
@@ -409,21 +549,10 @@ SuggestOutput Rwkv8CompletionEngine::suggest(
         return out;
     }
 
-    // Copy-on-Write speculative snapshot S_spec <- S_main
+    // Copy-on-Write speculative snapshot S_spec <- S_main (single-token <PREDICT> for both tail & FIM)
     RwkvState spState = mainState_;
     int32_t sIdx = sam_.lastState();
     int32_t sLen = sam_.lastLength();
-
-    std::vector<int32_t> promptToks;
-    if (hasFimSuffix) {
-        promptToks.push_back(TOK_AFTER);
-        auto sEnc = codec_.encode(utf8HeadChars(suffix, 40));
-        promptToks.insert(promptToks.end(), sEnc.begin(), sEnc.end());
-        promptToks.push_back(TOK_BEFORE);
-        auto pEnc = codec_.encode(utf8TailChars(prefix, 96));
-        promptToks.insert(promptToks.end(), pEnc.begin(), pEnc.end());
-    }
-    promptToks.push_back(TOK_PREDICT);
 
     const auto &cfg = runner_->config();
     const auto &tb = runner_->tables();
@@ -434,42 +563,14 @@ SuggestOutput Rwkv8CompletionEngine::suggest(
     std::vector<float> prePredictXOut = tmpXOut_;
     std::vector<float> stepXIn(static_cast<size_t>(cfg.nEmbd));
     std::vector<float> stepEnn(static_cast<size_t>(cfg.nLayer) * cfg.nEmbd);
-    int32_t lastNt = -1;
-    int32_t lastMl = 0;
-    bool inSpecAfter = false;
 
-    for (int32_t pt : promptToks) {
-        if (shouldAbort && shouldAbort()) {
-            out.cancelled = true;
-            return out;
-        }
-        if (pt == TOK_PREDICT && hasFimSuffix) {
-            prePredictXOut = xOut;
-        }
-        SamMatch m{-1, 0};
-        if (pt == TOK_AFTER) {
-            inSpecAfter = true;
-            sIdx = 0;
-            sLen = 0;
-        } else if (pt == TOK_BEFORE) {
-            inSpecAfter = false;
-            sIdx = 0;
-            sLen = 0;
-        } else if (pt == TOK_TYPE || pt == TOK_PREDICT) {
-            inSpecAfter = false;
-            m = sam_.queryFrom(sIdx, sLen);
-        } else if (!inSpecAfter) {
-            auto st = sam_.stepSpeculative(sIdx, sLen, pt);
-            sIdx = st.stateIdx;
-            sLen = st.curLen;
-            m = st.match;
-        }
-        prepareXIn(pt, m.nextTok, m.matchLen, stepXIn.data(), stepEnn.data());
-        runner_->inferStep(stepXIn.data(), stepEnn.data(), spState,
-                           logits.data(), xOut.data());
-        lastNt = m.nextTok;
-        lastMl = m.matchLen;
-    }
+    SamMatch predMatch = sam_.queryFrom(sIdx, sLen);
+    prepareXIn(TOK_PREDICT, predMatch.nextTok, predMatch.matchLen,
+               stepXIn.data(), stepEnn.data());
+    runner_->inferStep(stepXIn.data(), stepEnn.data(), spState, logits.data(),
+                       xOut.data());
+    int32_t lastNt = predMatch.nextTok;
+    int32_t lastMl = predMatch.matchLen;
 
     lastSuggestStep0XOut_ = prePredictXOut;
     lastSuggestStep0BaseLogits_ = logits;

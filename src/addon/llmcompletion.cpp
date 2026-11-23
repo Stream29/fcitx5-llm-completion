@@ -185,6 +185,7 @@ struct QueuedEventItem {
     TapeLogRecord logRec;
     InteractionEvent stateEv;
     bool feedState = false;
+    uint64_t anchorSeq = 0;
 };
 
 struct PendingSuggestTask {
@@ -442,6 +443,8 @@ public:
                 auto *ic =
                     static_cast<InputContextEvent &>(event).inputContext();
                 if (activeIC_ == ic) {
+                    latestAnchorSeq_.store(++nextAnchorSeq_,
+                                           std::memory_order_relaxed);
                     clearSelfCommitGuard();
                     clearProposal(ic);
                     cancelPending();
@@ -601,8 +604,19 @@ private:
                 }
                 logger_.log(item.logRec);
                 if (engine && item.feedState) {
+                    if (item.anchorSeq != 0 &&
+                        latestAnchorSeq_.load(std::memory_order_relaxed) !=
+                            item.anchorSeq) {
+                        continue;
+                    }
                     try {
-                        engine->handleEvent(item.stateEv);
+                        uint64_t curAnchor =
+                            latestAnchorSeq_.load(std::memory_order_relaxed);
+                        engine->handleEvent(item.stateEv, [&]() {
+                            return isStopRequested() ||
+                                   latestAnchorSeq_.load(
+                                       std::memory_order_relaxed) != curAnchor;
+                        });
                     } catch (const std::exception &e) {
                         FCITX_WARN() << "llmcompletion event error: " << e.what();
                     }
@@ -610,6 +624,20 @@ private:
             }
 
             if (!nextSuggest.has_value()) {
+                if (engine && engine->hasPendingContext()) {
+                    uint64_t anchorSnap =
+                        latestAnchorSeq_.load(std::memory_order_relaxed);
+                    try {
+                        engine->prewarmPendingContext([&]() {
+                            return isStopRequested() ||
+                                   latestAnchorSeq_.load(
+                                       std::memory_order_relaxed) != anchorSnap;
+                        });
+                    } catch (const std::exception &e) {
+                        FCITX_WARN()
+                            << "llmcompletion prewarm error: " << e.what();
+                    }
+                }
                 continue;
             }
             if (!engine) {
@@ -1162,7 +1190,11 @@ private:
             q.logRec.suffixHead = PredictionLogger::previewHead(sHead);
         }
 
+        uint64_t anchorSeq = ++nextAnchorSeq_;
+        latestAnchorSeq_.store(anchorSeq, std::memory_order_relaxed);
+
         q.feedState = true;
+        q.anchorSeq = anchorSeq;
         q.stateEv.event = ev;
         q.stateEv.program = program;
         q.stateEv.prefix = std::move(pTail);
@@ -1428,7 +1460,9 @@ private:
 
     uint64_t nextReqID_ = 0;
     uint64_t inflightReqID_ = 0;
+    uint64_t nextAnchorSeq_ = 0;
     std::atomic<uint64_t> activeReqId_{0};
+    std::atomic<uint64_t> latestAnchorSeq_{0};
     std::atomic<bool> engineReady_{false};
     std::atomic<bool> stopRequested_{false};
 
