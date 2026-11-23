@@ -11,7 +11,7 @@ android {
         applicationId = "org.fcitx.fcitx5.android.plugin.llm_completion"
         minSdk = 26
         targetSdk = 36
-        versionCode = 4
+        versionCode = 10
         versionName = "2.0.0"
 
         ndk {

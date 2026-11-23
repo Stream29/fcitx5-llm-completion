@@ -427,6 +427,20 @@ public:
                             ctx.pendingSelfCommits.pop_front();
                             return;
                         }
+                        ctx.pendingSelfCommits.clear();
+                    }
+                    if (hasProposal_ && activeIC_ == ic) {
+                        uint64_t reqID = proposalReqID_;
+                        std::string rem = proposalText_;
+                        int64_t shownMs = currentShownMs();
+                        clearSelfCommitGuard();
+                        clearProposal(ic);
+                        cancelPending();
+                        if (isRecordable(ic)) {
+                            enqueueProposalEvent(reqID, ic->program(),
+                                                 "dismiss_commit", "", rem,
+                                                 shownMs);
+                        }
                     }
                     recordCommittedText(ic, ce.text());
                     if (isRecordable(ic)) {
@@ -889,7 +903,26 @@ private:
             ic != activeIC_ || !ic || !ic->hasFocus()) {
             return;
         }
-        if (!isMainImIdle(ic) || !ic->inputPanel().clientPreedit().empty()) {
+        if (!ic->inputPanel().preedit().empty() ||
+            !ic->inputPanel().clientPreedit().empty()) {
+            uint64_t reqID = proposalReqID_;
+            std::string rem = proposalText_;
+            int64_t shownMs = currentShownMs();
+            clearSelfCommitGuard();
+            lockedByPartialAccept_ = false;
+            hasProposal_ = false;
+            proposalReqID_ = 0;
+            proposalShownAtUs_ = 0;
+            proposalText_.clear();
+            proposalChunks_.clear();
+            cancelPending();
+            if (isRecordable(ic)) {
+                enqueueProposalEvent(reqID, ic->program(), "dismiss_preedit",
+                                     "", rem, shownMs);
+            }
+            return;
+        }
+        if (!isMainImIdle(ic)) {
             return;
         }
 #ifndef __ANDROID__
@@ -1413,16 +1446,12 @@ private:
 #ifdef __ANDROID__
         auto candList = std::make_unique<CommonCandidateList>();
         candList->setPageSize(10);
-        if (!chunks.empty()) {
+        const size_t fullCount = std::max<size_t>(1, chunks.size());
+        candList->append<ProposalCandidateWord>(this, text, fullCount);
+        if (chunks.size() > 1) {
             for (size_t i = 0; i < chunks.size(); ++i) {
                 candList->append<ProposalCandidateWord>(this, chunks[i], i + 1);
             }
-            if (chunks.size() > 1) {
-                candList->append<ProposalCandidateWord>(this, "✓ " + text,
-                                                        chunks.size());
-            }
-        } else {
-            candList->append<ProposalCandidateWord>(this, text, 1);
         }
         ic->inputPanel().setCandidateList(std::move(candList));
 #else
