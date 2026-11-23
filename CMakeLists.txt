@@ -39,6 +39,9 @@ target_include_directories(fcitx5_llm_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_compile_options(fcitx5_llm_core PRIVATE -Wall -Wextra -O3)
+if(ANDROID AND ANDROID_ABI STREQUAL "arm64-v8a")
+    target_compile_options(fcitx5_llm_core PRIVATE -march=armv8.2-a+dotprod+fp16)
+endif()
 target_link_libraries(fcitx5_llm_core PUBLIC ZLIB::ZLIB)
 
 set(_OV_LIB_RPATH "")
