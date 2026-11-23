@@ -49,6 +49,7 @@ using namespace fcitx5_llm;
 constexpr size_t kMaxRingBytes = 6144;               // ~2048 CJK chars
 constexpr size_t kMaxUnackedBytes = 1024;            // unabsorbed commits awaiting SurroundingText sync
 constexpr uint64_t kSelfCommitResetGuardUs = 250000; // 250ms protection against client Reset echo
+constexpr uint64_t kSelfCommitEchoGuardUs = 200000;  // 200ms protection against async CommitString echo
 constexpr uint64_t kUnackedStaleUs = 800000;         // 800ms max age for unacked commit merge
 
 std::string getEnvTrimmed(const char *name) {
@@ -171,11 +172,18 @@ void sliceAfterPrefixBytes(const std::vector<std::string> &inChunks,
     }
 }
 
+struct SelfCommitEcho {
+    std::string text;
+    uint64_t expireUs = 0;
+};
+
 struct ContextState {
     std::string fallbackRing;
     std::string unackedCommits;
     std::string lastSeenStPrefix;
     std::string lastSeenStSuffix;
+    std::deque<SelfCommitEcho> pendingSelfCommits;
+    uint32_t userKeysSinceAccept = 0;
     bool hasSeenSt = false;
     uint64_t lastCommitUs = 0;
     uint64_t lastBackspaceUs = 0;
@@ -298,6 +306,12 @@ public:
                     return;
                 }
 
+                if (ic) {
+                    auto &ctx = contexts_[ic];
+                    if (++ctx.userKeysSinceAccept >= 2) {
+                        ctx.pendingSelfCommits.clear();
+                    }
+                }
                 clearSelfCommitGuard();
                 cancelPending();
             }));
@@ -331,7 +345,14 @@ public:
                 if (k.check(Key(FcitxKey_BackSpace))) {
                     auto &ctx = contexts_[ic];
                     std::string deleted = popLastUtf8Char(ctx.fallbackRing);
-                    popLastUtf8Char(ctx.unackedCommits);
+                    if (!ctx.unackedCommits.empty()) {
+                        popLastUtf8Char(ctx.unackedCommits);
+                    } else if (ctx.hasSeenSt && !ctx.lastSeenStPrefix.empty()) {
+                        std::string stDel = popLastUtf8Char(ctx.lastSeenStPrefix);
+                        if (deleted.empty()) {
+                            deleted = std::move(stDel);
+                        }
+                    }
                     ctx.lastBackspaceUs = now(CLOCK_MONOTONIC);
                     if (isRecordable(ic)) {
                         enqueueTypingEvent(ic->program(), "backspace", "key",
@@ -344,6 +365,7 @@ public:
                     auto &ctx = contexts_[ic];
                     ctx.fallbackRing.clear();
                     ctx.unackedCommits.clear();
+                    ctx.hasSeenSt = false;
                     if (isRecordable(ic)) {
                         enqueueTypingEvent(ic->program(), "user_type", "return",
                                            "\n");
@@ -362,6 +384,7 @@ public:
                     auto &ctx = contexts_[ic];
                     ctx.fallbackRing.clear();
                     ctx.unackedCommits.clear();
+                    ctx.hasSeenSt = false;
                     return;
                 }
 
@@ -392,6 +415,19 @@ public:
                 auto &ce = static_cast<CommitStringEvent &>(event);
                 auto *ic = ce.inputContext();
                 if (!ce.text().empty()) {
+                    if (ic) {
+                        auto &ctx = contexts_[ic];
+                        uint64_t nowUs = now(CLOCK_MONOTONIC);
+                        while (!ctx.pendingSelfCommits.empty() &&
+                               nowUs > ctx.pendingSelfCommits.front().expireUs) {
+                            ctx.pendingSelfCommits.pop_front();
+                        }
+                        if (!ctx.pendingSelfCommits.empty() &&
+                            ctx.pendingSelfCommits.front().text == ce.text()) {
+                            ctx.pendingSelfCommits.pop_front();
+                            return;
+                        }
+                    }
                     recordCommittedText(ic, ce.text());
                     if (isRecordable(ic)) {
                         enqueueTypingEvent(ic->program(), "user_type", "commit",
@@ -512,6 +548,7 @@ public:
                     clearSelfCommitGuard();
                     cancelPending();
                     hasProposal_ = false;
+                    lockedByPartialAccept_ = false;
                     proposalText_.clear();
                     proposalChunks_.clear();
                     proposalReqID_ = 0;
@@ -777,6 +814,11 @@ private:
         }
         inflightReqID_ = 0;
 
+        if (hasProposal_ && lockedByPartialAccept_ &&
+            proposalReqID_ != prop.reqId) {
+            return;
+        }
+
         std::string text = std::move(prop.text);
         std::vector<std::string> chunks = std::move(prop.chunks);
 
@@ -935,10 +977,14 @@ private:
         const bool inBackspaceWindow =
             (ctx.lastBackspaceUs != 0 && nowUs - ctx.lastBackspaceUs <= 250000);
 
+        const bool suffixSameOrBothBlank =
+            (stSuffix == ctx.lastSeenStSuffix ||
+             (trimWhitespace(stSuffix).empty() &&
+              trimWhitespace(ctx.lastSeenStSuffix).empty()));
+
         if (ctx.hasSeenSt) {
-            if (stPrefix == ctx.lastSeenStPrefix &&
-                stSuffix == ctx.lastSeenStSuffix) {
-            } else if (stSuffix == ctx.lastSeenStSuffix &&
+            if (stPrefix == ctx.lastSeenStPrefix && suffixSameOrBothBlank) {
+            } else if (suffixSameOrBothBlank &&
                        stPrefix.size() > ctx.lastSeenStPrefix.size() &&
                        stPrefix.compare(0, ctx.lastSeenStPrefix.size(),
                                         ctx.lastSeenStPrefix) == 0) {
@@ -957,7 +1003,7 @@ private:
                        ctx.lastSeenStPrefix.size() > stPrefix.size() &&
                        ctx.lastSeenStPrefix.compare(0, stPrefix.size(),
                                                     stPrefix) == 0 &&
-                       (stSuffix == ctx.lastSeenStSuffix ||
+                       (suffixSameOrBothBlank ||
                         (stSuffix.size() ==
                              (ctx.lastSeenStPrefix.size() - stPrefix.size()) +
                                  ctx.lastSeenStSuffix.size() &&
@@ -971,10 +1017,11 @@ private:
                              ctx.lastSeenStSuffix.size(),
                              ctx.lastSeenStSuffix) == 0))) {
             } else if (inBackspaceWindow && stPrefix == ctx.lastSeenStPrefix &&
-                       ctx.lastSeenStSuffix.size() > stSuffix.size() &&
-                       ctx.lastSeenStSuffix.compare(
-                           ctx.lastSeenStSuffix.size() - stSuffix.size(),
-                           stSuffix.size(), stSuffix) == 0) {
+                       (suffixSameOrBothBlank ||
+                        (ctx.lastSeenStSuffix.size() > stSuffix.size() &&
+                         ctx.lastSeenStSuffix.compare(
+                             ctx.lastSeenStSuffix.size() - stSuffix.size(),
+                             stSuffix.size(), stSuffix) == 0))) {
             } else {
                 ctx.unackedCommits.clear();
                 externalJump = true;
@@ -1002,10 +1049,11 @@ private:
         if (readRawSurrounding(ic, stPrefix, stSuffix, cursor)) {
             bool jumped =
                 reconcileSurrounding(contexts_[ic], stPrefix, stSuffix);
-            if (emitJump && jumped) {
-                if (hasProposal_ && activeIC_ == ic &&
-                    (ic != selfCommitIC_ ||
-                     now(CLOCK_MONOTONIC) > selfCommitProtectUntilUs_)) {
+            const bool underSelfCommitGuard =
+                (ic == selfCommitIC_ &&
+                 now(CLOCK_MONOTONIC) <= selfCommitProtectUntilUs_);
+            if (emitJump && jumped && !underSelfCommitGuard) {
+                if (hasProposal_ && activeIC_ == ic) {
                     int64_t shownMs = currentShownMs();
                     if (isRecordable(ic)) {
                         enqueueProposalEvent(proposalReqID_, ic->program(),
@@ -1046,6 +1094,10 @@ private:
             if (prefix.empty() && suffix.empty() && !ctx.fallbackRing.empty()) {
                 prefix = ctx.fallbackRing;
             }
+        } else if (ctx.hasSeenSt) {
+            prefix = ctx.lastSeenStPrefix + ctx.unackedCommits;
+            suffix = ctx.lastSeenStSuffix;
+            appliedPending = ctx.unackedCommits;
         } else {
             prefix = ctx.fallbackRing;
         }
@@ -1094,8 +1146,13 @@ private:
         if (!enabled_ || !ic || !engineReady_.load(std::memory_order_acquire)) {
             return;
         }
+        std::string r = reason ? reason : "unknown";
+        if (hasProposal_ && lockedByPartialAccept_ && activeIC_ == ic &&
+            r != "chain_accept") {
+            return;
+        }
         activeIC_ = ic;
-        pendingTriggerReason_ = reason ? reason : "unknown";
+        pendingTriggerReason_ = std::move(r);
         deferTrigger_ = instance_->eventLoop().addDeferEvent(
             [this](EventSource *) {
                 deferTrigger_.reset();
@@ -1294,13 +1351,13 @@ private:
         int64_t shownMs = currentShownMs();
         clearProposal(ic);
 
-        if (!remaining.empty()) {
-            selfCommitIC_ = ic;
-            selfCommitProtectUntilUs_ =
-                now(CLOCK_MONOTONIC) + kSelfCommitResetGuardUs;
-        } else {
-            clearSelfCommitGuard();
-        }
+        uint64_t nowUs = now(CLOCK_MONOTONIC);
+        selfCommitIC_ = ic;
+        selfCommitProtectUntilUs_ = nowUs + kSelfCommitResetGuardUs;
+        auto &ctx = contexts_[ic];
+        ctx.userKeysSinceAccept = 0;
+        ctx.pendingSelfCommits.push_back(
+            SelfCommitEcho{accepted, nowUs + kSelfCommitEchoGuardUs});
 
         suppressNextCommit_ = true;
         ic->commitString(accepted);
@@ -1314,7 +1371,9 @@ private:
 
         if (!remaining.empty()) {
             showProposal(ic, remaining, remainingChunks, reqID);
+            lockedByPartialAccept_ = true;
         } else if (!streamStillInflight) {
+            lockedByPartialAccept_ = false;
             scheduleTrigger(ic, "chain_accept");
         }
     }
@@ -1375,6 +1434,7 @@ private:
     }
 
     void clearProposal(InputContext *ic) {
+        lockedByPartialAccept_ = false;
         if (!hasProposal_) {
             return;
         }
@@ -1438,6 +1498,7 @@ private:
 
     bool enabled_ = true;
     bool hasProposal_ = false;
+    bool lockedByPartialAccept_ = false;
     bool suppressNextCommit_ = false;
     bool updatingOwnUI_ = false;
     uint64_t proposalReqID_ = 0;
